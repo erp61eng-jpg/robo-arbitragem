@@ -18,18 +18,19 @@ except Exception as e:
 
 MotorClasse = None
 modo_motor = None
+erro_motor = None
 
 try:
     from motor_dados import MotorDados
     MotorClasse = MotorDados
     modo_motor = "motor_dados"
-except Exception:
+except Exception as e1:
     try:
         from motor_arbitragem import MotorArbitragem
         MotorClasse = MotorArbitragem
         modo_motor = "motor_arbitragem"
-    except Exception:
-        MotorClasse = None
+    except Exception as e2:
+        erro_motor = f"motor_dados: {e1} | motor_arbitragem: {e2}"
 
 if erro_executor:
     st.warning(f"Aviso no executor.py: {erro_executor}")
@@ -48,9 +49,11 @@ if "ultimo_df" not in st.session_state:
     st.session_state.ultimo_df = pd.DataFrame()
 if "fonte_dados" not in st.session_state:
     st.session_state.fonte_dados = "Aguardando ciclo"
+if "ultimo_aviso_motor" not in st.session_state:
+    st.session_state.ultimo_aviso_motor = ""
 if "executor" not in st.session_state and ExecutorArbitragem is not None:
     st.session_state.executor = ExecutorArbitragem(
-        modo=getattr(config, "MODO_EXECUCAO", "DRY_RUN"),
+        modo="DRY_RUN",
         lote_max_usdt=getattr(config, "LOTE_OPERACAO_USDT", 1000.0),
         gatilho_pct=getattr(config, "SPREAD_MINIMO_LIQUIDO", 0.05),
     )
@@ -117,7 +120,7 @@ def _resumo_agrupado(trades: list[dict], coluna_grupo: str) -> pd.DataFrame:
 
 async def _coletar_dados():
     if MotorClasse is None:
-        return []
+        raise RuntimeError(erro_motor or "Nenhuma classe de motor encontrada")
     motor = MotorClasse()
     try:
         if modo_motor == "motor_dados":
@@ -130,25 +133,42 @@ async def _coletar_dados():
             await motor.fechar_conexoes()
 
 
-def _executar_ciclo(lote_usdt: float, filtro_est: list[str], meta_alvo: float, auto_travar: bool, max_perda: float):
+def _executar_ciclo(
+    lote_usdt: float,
+    filtro_est: list[str],
+    meta_alvo: float,
+    auto_travar: bool,
+    max_perda: float,
+    origem_modo: str,
+):
     dados_atuais = []
-    fonte = "Simulação Cloud (Memória)"
+    rotulo_origem = "Simulação de Apoio"
+    st.session_state.ultimo_aviso_motor = ""
 
-    if MotorClasse is not None:
+    if origem_modo in ("Auto (Motor Real -> Fallback Simulação)", "Apenas Motor Real"):
         try:
             coletados = asyncio.run(_coletar_dados())
             if coletados:
                 dados_atuais = coletados
-                fonte = f"Motor ({modo_motor})"
-        except Exception:
-            dados_atuais = []
+                rotulo_origem = "Motor Real"
+            elif origem_modo == "Apenas Motor Real":
+                st.session_state.ultimo_aviso_motor = "O motor real retornou lista vazia neste ciclo."
+        except Exception as e:
+            if origem_modo == "Apenas Motor Real":
+                st.session_state.ultimo_aviso_motor = f"Falha ao consultar o motor real: {e}"
+
+    if not dados_atuais and origem_modo != "Apenas Motor Real":
+        dados_atuais = _gerar_sinais_apoio(lote_usdt)
+        rotulo_origem = "Simulação de Apoio"
+
+    st.session_state.fonte_dados = rotulo_origem
 
     if not dados_atuais:
-        dados_atuais = _gerar_sinais_apoio(lote_usdt)
-        fonte = "Simulação Cloud (Memória)"
+        st.session_state.ultimo_df = pd.DataFrame()
+        return
 
-    st.session_state.fonte_dados = fonte
     df = pd.DataFrame(dados_atuais)
+    df["Origem"] = rotulo_origem
 
     if "Funding_8h_%" not in df.columns:
         df["Funding_8h_%"] = 0.0
@@ -166,6 +186,7 @@ def _executar_ciclo(lote_usdt: float, filtro_est: list[str], meta_alvo: float, a
         for _, row in df.iterrows():
             sinal = row.to_dict()
             resultado = st.session_state.executor.executar_ordem(sinal)
+            resultado["Origem"] = rotulo_origem
             st.session_state.historico_decisoes.insert(0, resultado)
             st.session_state.historico_decisoes = st.session_state.historico_decisoes[:300]
 
@@ -187,11 +208,20 @@ def _executar_ciclo(lote_usdt: float, filtro_est: list[str], meta_alvo: float, a
 
 with st.sidebar:
     st.header("⚙️ Parâmetros do Robô")
+    origem_dados = st.selectbox(
+        "Origem dos Dados",
+        [
+            "Auto (Motor Real -> Fallback Simulação)",
+            "Apenas Motor Real",
+            "Apenas Simulação de Apoio",
+        ],
+        index=0,
+    )
     auto_atualizar = st.toggle("Atualização Automática", value=False)
     intervalo_seg = st.slider("Intervalo automático (seg)", 5, 30, 10)
     mostrar_todas_colunas = st.toggle("Mostrar todas as colunas", value=False)
     lote = st.number_input("Lote por Operação (USDT)", value=float(getattr(config, "LOTE_OPERACAO_USDT", 1000.0)), step=100.0)
-    gatilho = st.number_input("Gatilho Lucro Líquido Mínimo (%)", value=0.01, step=0.01, format="%.2f")
+    gatilho = st.number_input("Gatilho Lucro Líquido Mínimo (%)", value=float(getattr(config, "SPREAD_MINIMO_LIQUIDO", 0.05)), step=0.01, format="%.2f")
     meta_lucro = st.number_input("Meta de Lucro Simulado (USDT)", min_value=0.0, value=10.0, step=1.0, format="%.2f")
     travar_ao_atingir_meta = st.toggle("Travar executor ao atingir meta", value=False)
     limite_prejuizo = st.number_input("Limite Máximo de Prejuízo (USDT)", min_value=0.0, value=5.0, step=1.0, format="%.2f")
@@ -202,6 +232,7 @@ with st.sidebar:
     )
 
     if "executor" in st.session_state:
+        st.session_state.executor.modo = "DRY_RUN"
         st.divider()
         st.subheader("🛑 Trava de Segurança (Executor)")
         if st.session_state.executor.travado:
@@ -233,15 +264,19 @@ col_acao1, col_acao2 = st.columns([1, 3])
 with col_acao1:
     rodar_agora = st.button("🔄 Rodar Ciclo Agora", width="stretch")
 with col_acao2:
-    st.caption(f"Fonte atual: **{st.session_state.fonte_dados}** | Modo: **DRY_RUN** (Memória)")
+    motor_status = modo_motor if modo_motor else "não encontrado"
+    st.caption(f"Fonte atual: **{st.session_state.fonte_dados}** | Motor: `{motor_status}` | Modo: **DRY_RUN**")
+
+if st.session_state.ultimo_aviso_motor:
+    st.warning(st.session_state.ultimo_aviso_motor)
 
 if rodar_agora or st.session_state.ultimo_df.empty:
-    _executar_ciclo(lote, filtro_estrategia, meta_lucro, travar_ao_atingir_meta, limite_prejuizo)
+    _executar_ciclo(lote, filtro_estrategia, meta_lucro, travar_ao_atingir_meta, limite_prejuizo, origem_dados)
 
 if auto_atualizar:
     @st.fragment(run_every=intervalo_seg)
     def _loop_silencioso():
-        _executar_ciclo(lote, filtro_estrategia, meta_lucro, travar_ao_atingir_meta, limite_prejuizo)
+        _executar_ciclo(lote, filtro_estrategia, meta_lucro, travar_ao_atingir_meta, limite_prejuizo, origem_dados)
         st.rerun()
 
     _loop_silencioso()
@@ -269,10 +304,10 @@ c2.metric("Aprovadas no Histórico", len(ultimas_ciclo))
 c3.metric("Ordens Simuladas (Sessão)", len(st.session_state.historico_trades))
 c4.metric("Lucro Líquido Simulado", f"$ {st.session_state.lucro_acumulado:.2f} USDT")
 
-colunas_compactas = [c for c in ["Ativo", "Rota", "Spread_Liquido_%", "Lucro_Est_USDT"] if c in df.columns]
+colunas_compactas = [c for c in ["Origem", "Ativo", "Rota", "Spread_Liquido_%", "Lucro_Est_USDT"] if c in df.columns]
 colunas_completas = [
     c for c in [
-        "Hora", "Estrategia", "Ativo", "Rota", "Funding_8h_%",
+        "Hora", "Origem", "Estrategia", "Ativo", "Rota", "Funding_8h_%",
         "Spread_Bruto_%", "Spread_Liquido_%", "Lucro_Est_USDT", "Liquidez_Ponta_USDT"
     ] if c in df.columns
 ]
@@ -283,6 +318,13 @@ if not df.empty:
     st.dataframe(df[cols_ativas] if cols_ativas else df, width="stretch", height=300)
 else:
     st.info("Sem linhas no radar.")
+
+st.subheader("⚖️ Comparação: Motor Real vs. Simulação de Apoio")
+res_origem = _resumo_agrupado(st.session_state.historico_trades, "Origem")
+if not res_origem.empty:
+    st.dataframe(res_origem, width="stretch", height=150)
+else:
+    st.caption("Execute ciclos com ordens aprovadas para comparar o desempenho acumulado por origem.")
 
 st.subheader("🏆 Onde o Simulador Ganha Mais (Estratégia & Ativo)")
 res_est = _resumo_agrupado(st.session_state.historico_trades, "Estrategia")
@@ -328,7 +370,7 @@ aba_ordens, aba_decisoes = st.tabs(["✅ Ordens Simuladas", "🔎 Decisões & Mo
 with aba_ordens:
     if st.session_state.historico_trades:
         df_ordens = pd.DataFrame(st.session_state.historico_trades)
-        cols_ordens = [c for c in ["Hora", "Ativo", "Rota", "Lote_USDT", "Spread_Liquido_%", "Lucro_Liquido_USDT", "status"] if c in df_ordens.columns]
+        cols_ordens = [c for c in ["Hora", "Origem", "Ativo", "Rota", "Lote_USDT", "Spread_Liquido_%", "Lucro_Liquido_USDT", "status"] if c in df_ordens.columns]
         st.dataframe(df_ordens[cols_ordens] if cols_ordens else df_ordens, width="stretch", height=220)
     else:
         st.caption("Nenhuma ordem simulada ainda.")
@@ -336,7 +378,7 @@ with aba_ordens:
 with aba_decisoes:
     if st.session_state.historico_decisoes:
         df_dec = pd.DataFrame(st.session_state.historico_decisoes)
-        cols_dec = [c for c in ["Hora", "Ativo", "Rota", "Spread_Liquido_%", "status", "motivo"] if c in df_dec.columns]
+        cols_dec = [c for c in ["Hora", "Origem", "Ativo", "Rota", "Spread_Liquido_%", "status", "motivo"] if c in df_dec.columns]
         st.dataframe(df_dec[cols_dec] if cols_dec else df_dec, width="stretch", height=240)
     else:
         st.caption("Nenhuma decisão registrada ainda.")
