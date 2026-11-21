@@ -70,7 +70,7 @@ def _gerar_sinais_apoio(lote_usdt: float) -> list[dict]:
     ]
     sinais = []
     for ativo, est, rota, sp_base in base:
-        sp_liq = round(max(-0.05, sp_base + random.uniform(-0.04, 0.12)), 4)
+        sp_liq = round(max(-0.05, sp_base + random.uniform(-0.06, 0.14)), 4)
         sp_bruto = round(sp_liq + 0.18, 4)
         lucro_est = round(lote_usdt * (sp_liq / 100.0), 4)
         sinais.append({
@@ -82,9 +82,81 @@ def _gerar_sinais_apoio(lote_usdt: float) -> list[dict]:
             "Spread_Bruto_%": sp_bruto,
             "Spread_Liquido_%": sp_liq,
             "Lucro_Est_USDT": lucro_est,
-            "Liquidez_Ponta_USDT": round(lote_usdt * random.uniform(1.2, 6.0), 2),
+            "Liquidez_Ponta_USDT": round(lote_usdt * random.uniform(0.8, 6.0), 2),
         })
     return sinais
+
+
+def _calcular_qualidade_dataframe(df: pd.DataFrame, lote_usdt: float) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    out = df.copy()
+    sp = pd.to_numeric(out.get("Spread_Liquido_%", 0.0), errors="coerce").fillna(0.0)
+    lucro = pd.to_numeric(out.get("Lucro_Est_USDT", 0.0), errors="coerce")
+    if "Lucro_Est_USDT" not in out.columns:
+        lucro = lote_usdt * (sp / 100.0)
+    else:
+        lucro = lucro.fillna(lote_usdt * (sp / 100.0))
+
+    liq = pd.to_numeric(out.get("Liquidez_Ponta_USDT", lote_usdt * 2.0), errors="coerce").fillna(lote_usdt * 2.0)
+
+    # Score 0-100: 50% spread líquido, 30% potencial de lucro vs lote, 20% liquidez disponível
+    pts_spread = ((sp / 0.25).clip(lower=0.0, upper=1.0)) * 50.0
+    lucro_alvo = max(0.5, lote_usdt * 0.002)
+    pts_lucro = ((lucro / lucro_alvo).clip(lower=0.0, upper=1.0)) * 30.0
+    liq_alvo = max(500.0, lote_usdt * 3.0)
+    pts_liq = ((liq / liq_alvo).clip(lower=0.0, upper=1.0)) * 20.0
+
+    score = (pts_spread + pts_lucro + pts_liq).round(1)
+    out["Lucro_Est_USDT"] = lucro.round(4)
+    out["Score_Qualidade"] = score
+
+    def _rotulo(row):
+        if row["Spread_Liquido_%"] <= 0 or row["Score_Qualidade"] < 45:
+            return "🔴 Fraca"
+        if row["Score_Qualidade"] >= 75:
+            return "🟢 Top Lucro"
+        return "🟡 Moderada"
+
+    out["Qualidade"] = out.apply(_rotulo, axis=1)
+    return out
+
+
+def _estilizar_radar(df: pd.DataFrame):
+    if df.empty:
+        return df
+
+    def _estilo_linha(row):
+        sp = float(row.get("Spread_Liquido_%", 0.0) or 0.0)
+        sc = float(row.get("Score_Qualidade", 0.0) or 0.0)
+
+        if sp <= 0 or sc < 45:
+            bg = "#fde8e8"
+            fg = "#7f1d1d"
+        elif sc >= 75:
+            bg = "#dcfce7"
+            fg = "#14532d"
+        else:
+            bg = "#fef9c3"
+            fg = "#713f12"
+
+        estilos = []
+        for col in df.columns:
+            if col in ("Qualidade", "Score_Qualidade", "Spread_Liquido_%", "Lucro_Est_USDT"):
+                estilos.append(f"background-color: {bg}; color: {fg}; font-weight: 700;")
+            else:
+                estilos.append(f"background-color: {bg}; color: {fg};")
+        return estilos
+
+    return df.style.apply(_estilo_linha, axis=1).format({
+        "Spread_Liquido_%": "{:.4f}%",
+        "Spread_Bruto_%": "{:.4f}%",
+        "Funding_8h_%": "{:.4f}%",
+        "Lucro_Est_USDT": "$ {:.4f}",
+        "Liquidez_Ponta_USDT": "$ {:.2f}",
+        "Score_Qualidade": "{:.1f}",
+    }, na_rep="-")
 
 
 def _csv_bytes_memoria(registros: list[dict]) -> bytes:
@@ -177,8 +249,11 @@ def _executar_ciclo(
 
     if "Estrategia" in df.columns and filtro_est:
         df = df[df["Estrategia"].isin(filtro_est)]
-    if "Spread_Liquido_%" in df.columns:
-        df = df.sort_values(by="Spread_Liquido_%", ascending=False).reset_index(drop=True)
+
+    df = _calcular_qualidade_dataframe(df, lote_usdt)
+
+    if not df.empty:
+        df = df.sort_values(by=["Score_Qualidade", "Lucro_Est_USDT"], ascending=[False, False]).reset_index(drop=True)
 
     st.session_state.ultimo_df = df
 
@@ -187,6 +262,7 @@ def _executar_ciclo(
             sinal = row.to_dict()
             resultado = st.session_state.executor.executar_ordem(sinal)
             resultado["Origem"] = rotulo_origem
+            resultado["Qualidade"] = sinal.get("Qualidade", "")
             st.session_state.historico_decisoes.insert(0, resultado)
             st.session_state.historico_decisoes = st.session_state.historico_decisoes[:300]
 
@@ -217,6 +293,7 @@ with st.sidebar:
         ],
         index=0,
     )
+    apenas_top_lucro = st.toggle("Destacar só oportunidades com spread > 0", value=False)
     auto_atualizar = st.toggle("Atualização Automática", value=False)
     intervalo_seg = st.slider("Intervalo automático (seg)", 5, 30, 10)
     mostrar_todas_colunas = st.toggle("Mostrar todas as colunas", value=False)
@@ -294,28 +371,36 @@ if meta_lucro > 0:
     if lucro_atual >= meta_lucro:
         st.success(f"🎯 META ATINGIDA! Lucro simulado acumulado: $ {lucro_atual:.2f} USDT")
 
-df = st.session_state.ultimo_df
+df = st.session_state.ultimo_df.copy()
+if not df.empty and apenas_top_lucro and "Spread_Liquido_%" in df.columns:
+    df = df[df["Spread_Liquido_%"] > 0].reset_index(drop=True)
+
 c1, c2 = st.columns(2)
 c3, c4 = st.columns(2)
 melhor_spread = df["Spread_Liquido_%"].max() if not df.empty and "Spread_Liquido_%" in df.columns else 0.0
-ultimas_ciclo = [d for d in st.session_state.historico_decisoes if d.get("status") == "SIMULADO_OK"]
+melhor_lucro = df["Lucro_Est_USDT"].max() if not df.empty and "Lucro_Est_USDT" in df.columns else 0.0
 c1.metric("Melhor Spread Líquido Agora", f"{melhor_spread:.4f}%")
-c2.metric("Aprovadas no Histórico", len(ultimas_ciclo))
+c2.metric("Maior Lucro Est. no Radar", f"$ {melhor_lucro:.4f} USDT")
 c3.metric("Ordens Simuladas (Sessão)", len(st.session_state.historico_trades))
 c4.metric("Lucro Líquido Simulado", f"$ {st.session_state.lucro_acumulado:.2f} USDT")
 
-colunas_compactas = [c for c in ["Origem", "Ativo", "Rota", "Spread_Liquido_%", "Lucro_Est_USDT"] if c in df.columns]
+colunas_compactas = [
+    c for c in ["Qualidade", "Score_Qualidade", "Ativo", "Rota", "Spread_Liquido_%", "Lucro_Est_USDT"]
+    if c in df.columns
+]
 colunas_completas = [
     c for c in [
-        "Hora", "Origem", "Estrategia", "Ativo", "Rota", "Funding_8h_%",
-        "Spread_Bruto_%", "Spread_Liquido_%", "Lucro_Est_USDT", "Liquidez_Ponta_USDT"
+        "Hora", "Qualidade", "Score_Qualidade", "Origem", "Estrategia", "Ativo", "Rota",
+        "Funding_8h_%", "Spread_Bruto_%", "Spread_Liquido_%", "Lucro_Est_USDT", "Liquidez_Ponta_USDT"
     ] if c in df.columns
 ]
 cols_ativas = colunas_completas if mostrar_todas_colunas else colunas_compactas
 
-st.subheader("📡 Radar de Oportunidades")
+st.subheader("📡 Radar Dinâmico de Oportunidades (Por Qualidade & Potencial de Lucro)")
+st.caption("Legenda: 🟢 Top Lucro (Score >= 75) | 🟡 Moderada (Score 45–74.9) | 🔴 Fraca (Score < 45 ou Spread <= 0)")
 if not df.empty:
-    st.dataframe(df[cols_ativas] if cols_ativas else df, width="stretch", height=300)
+    df_exibir = df[cols_ativas] if cols_ativas else df
+    st.dataframe(_estilizar_radar(df_exibir), width="stretch", height=310)
 else:
     st.info("Sem linhas no radar.")
 
@@ -370,7 +455,7 @@ aba_ordens, aba_decisoes = st.tabs(["✅ Ordens Simuladas", "🔎 Decisões & Mo
 with aba_ordens:
     if st.session_state.historico_trades:
         df_ordens = pd.DataFrame(st.session_state.historico_trades)
-        cols_ordens = [c for c in ["Hora", "Origem", "Ativo", "Rota", "Lote_USDT", "Spread_Liquido_%", "Lucro_Liquido_USDT", "status"] if c in df_ordens.columns]
+        cols_ordens = [c for c in ["Hora", "Qualidade", "Origem", "Ativo", "Rota", "Lote_USDT", "Spread_Liquido_%", "Lucro_Liquido_USDT", "status"] if c in df_ordens.columns]
         st.dataframe(df_ordens[cols_ordens] if cols_ordens else df_ordens, width="stretch", height=220)
     else:
         st.caption("Nenhuma ordem simulada ainda.")
@@ -378,7 +463,7 @@ with aba_ordens:
 with aba_decisoes:
     if st.session_state.historico_decisoes:
         df_dec = pd.DataFrame(st.session_state.historico_decisoes)
-        cols_dec = [c for c in ["Hora", "Origem", "Ativo", "Rota", "Spread_Liquido_%", "status", "motivo"] if c in df_dec.columns]
+        cols_dec = [c for c in ["Hora", "Qualidade", "Origem", "Ativo", "Rota", "Spread_Liquido_%", "status", "motivo"] if c in df_dec.columns]
         st.dataframe(df_dec[cols_dec] if cols_dec else df_dec, width="stretch", height=240)
     else:
         st.caption("Nenhuma decisão registrada ainda.")
