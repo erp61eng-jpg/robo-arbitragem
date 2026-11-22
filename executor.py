@@ -108,6 +108,16 @@ class ExecutorArbitragem:
         self.motivo_trava = ""
         self._salvar_estado()
 
+    def calcular_lote_fechamento_dia(
+        self,
+        saldo_base_usdt: float,
+        percentual_uso: float = 0.50,
+    ) -> float:
+        saldo_pos_dia = max(0.0, float(saldo_base_usdt) + float(self.pnl_acumulado_usdt))
+        lote_calculado = saldo_pos_dia * float(percentual_uso)
+        lote_limitado = min(lote_calculado, float(self.cfg.lote_maximo_usdt))
+        return round(max(float(self.cfg.lote_minimo_usdt), lote_limitado), 2)
+
     def calcular_viabilidade(
         self, lote_usdt: float, spread_bruto_pct: float
     ) -> Tuple[float, float, float]:
