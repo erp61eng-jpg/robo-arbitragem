@@ -9,14 +9,14 @@ import streamlit as st
 from executor import ConfigRisco, ExecutorArbitragem
 from motor_dados import ControleRateLimit, MotorDadosArbitragem
 
-st.set_page_config(page_title="Arbitragem Automatica — Somente Executadas", layout="wide")
-st.title("Arbitragem Automatica — Rodando & Contabilizando Apenas Executadas")
+st.set_page_config(page_title="Arbitragem Automatica — 162 USDT (81 Binance + 81 Bybit)", layout="wide")
+st.title("Arbitragem Automatica — Capital 162 USDT (81 Binance + 81 Bybit)")
 
 
 def _stats_padrao() -> dict:
     return {
-        "Binance": {"lucro_usdt": 0.0, "loss_usdt": 0.0, "ops": 0},
-        "Bybit": {"lucro_usdt": 0.0, "loss_usdt": 0.0, "ops": 0},
+        "Binance": {"saldo_base_usdt": 81.0, "lucro_usdt": 0.0, "loss_usdt": 0.0, "ops": 0},
+        "Bybit": {"saldo_base_usdt": 81.0, "lucro_usdt": 0.0, "loss_usdt": 0.0, "ops": 0},
     }
 
 
@@ -26,7 +26,7 @@ def _init_state():
         "acum_usdt": 0.0,
         "custos_usdt": 0.0,
         "executadas_qtd": 0,
-        "lote_dia_atual": 180.0,
+        "lote_dia_atual": 40.5,
         "auto_ativo": True,
         "linhas": [],
         "hist": [],
@@ -79,6 +79,8 @@ def _obter_motor() -> MotorDadosArbitragem:
 
 
 def _obter_executor(
+    capital_total: float,
+    saldo_corretora: float,
     lote_max: float,
     meta_ganho: float,
     perda_max: float,
@@ -90,9 +92,10 @@ def _obter_executor(
 ) -> ExecutorArbitragem:
     valores_cfg = {
         "dry_run": True,
-        "capital_referencia_usdt": 180.0,
+        "capital_referencia_usdt": capital_total,
+        "saldo_por_corretora_usdt": saldo_corretora,
         "lote_minimo_usdt": 15.0,
-        "lote_maximo_usdt": lote_max,
+        "lote_maximo_usdt": min(lote_max, saldo_corretora),
         "meta_ganho_sessao_usdt": meta_ganho,
         "perda_maxima_sessao_usdt": perda_max,
         "max_ordens_sessao": max_ordens,
@@ -116,7 +119,6 @@ def _obter_executor(
     if not hasattr(ex, "ciclos_sem_oportunidade"):
         ex.ciclos_sem_oportunidade = 0
 
-    # Na primeira abertura com o novo painel, limpa travas antigas herdadas do JSON
     if not st.session_state.get("destravado_inicial", False):
         ex.travado_por_risco = False
         ex.status_meta = "EM_ANDAMENTO"
@@ -134,7 +136,8 @@ def _obter_executor(
 def rodar_ciclo(
     motor: MotorDadosArbitragem,
     executor: ExecutorArbitragem,
-    lote_base: float,
+    capital_total: float,
+    saldo_corretora: float,
     cotacao: float,
     atualizar_lote_fim_dia: bool,
     pct_lote_dia: float,
@@ -148,7 +151,11 @@ def rodar_ciclo(
     c_num = st.session_state.ciclo
     novas_executadas = []
 
-    lote_efetivo = min(float(st.session_state.lote_dia_atual), float(executor.cfg.lote_maximo_usdt))
+    lote_efetivo = min(
+        float(st.session_state.lote_dia_atual),
+        float(executor.cfg.lote_maximo_usdt),
+        float(saldo_corretora),
+    )
     cotacoes = motor.coletar_ciclo(motor.ATIVOS_PADRAO)
 
     for cot in cotacoes:
@@ -161,17 +168,21 @@ def rodar_ciclo(
 
         corretora = _extrair_corretora(cot.rota)
         if corretora not in st.session_state.stats_corretoras:
-            st.session_state.stats_corretoras[corretora] = {"lucro_usdt": 0.0, "loss_usdt": 0.0, "ops": 0}
+            st.session_state.stats_corretoras[corretora] = {
+                "saldo_base_usdt": saldo_corretora,
+                "lucro_usdt": 0.0,
+                "loss_usdt": 0.0,
+                "ops": 0,
+            }
 
         res = executor.avaliar_e_executar(
             ativo=cot.ativo,
             rota=cot.rota,
             lote_usdt=lote_efetivo,
             spread_bruto_pct=cot.spread_bruto_pct,
-            saldo_disponivel_usdt=max(lote_base, float(st.session_state.lote_dia_atual)),
+            saldo_disponivel_usdt=saldo_corretora,
         )
 
-        # Contabiliza e exibe EXCLUSIVAMENTE o que foi executado
         if res.decisao not in ("EXECUTADO_DRY_RUN", "EXECUTADO_LIVE"):
             continue
 
@@ -183,6 +194,7 @@ def rodar_ciclo(
         st.session_state.acum_usdt = executor.pnl_acumulado_usdt
         st.session_state.custos_usdt = executor.custos_acumulados_usdt
         st.session_state.stats_corretoras[corretora]["ops"] += 1
+        st.session_state.stats_corretoras[corretora]["saldo_base_usdt"] = saldo_corretora
 
         if liq_usdt >= 0:
             st.session_state.stats_corretoras[corretora]["lucro_usdt"] = round(
@@ -220,7 +232,7 @@ def rodar_ciclo(
 
     if atualizar_lote_fim_dia and hasattr(executor, "calcular_lote_fechamento_dia"):
         st.session_state.lote_dia_atual = executor.calcular_lote_fechamento_dia(
-            saldo_base_usdt=lote_base,
+            saldo_base_usdt=capital_total,
             percentual_uso=pct_lote_dia,
         )
 
@@ -230,8 +242,8 @@ def rodar_ciclo(
         st.session_state.linhas = (novas_executadas + st.session_state.linhas)[:80]
 
 
-def renderizar_bloco_corretoras(cotacao: float):
-    st.subheader("🟢 Lucro e 🔴 Loss por Corretora (Apenas Executadas)")
+def renderizar_bloco_corretoras(cotacao: float, saldo_corretora: float):
+    st.subheader("🟢 Lucro e 🔴 Loss por Corretora (Base 81.0 USDT Cada)")
     stats = st.session_state.get("stats_corretoras") or _stats_padrao()
     nomes = list(stats.keys()) or ["Binance", "Bybit"]
     cols = st.columns(len(nomes))
@@ -241,25 +253,26 @@ def renderizar_bloco_corretoras(cotacao: float):
         lucro_u = float(dados.get("lucro_usdt", 0.0))
         loss_u = float(dados.get("loss_usdt", 0.0))
         saldo_liq_u = round(lucro_u - loss_u, 4)
+        saldo_atual_cor = round(saldo_corretora + saldo_liq_u, 4)
         ops_qtd = int(dados.get("ops", 0))
         sinal_saldo = "🟢 +" if saldo_liq_u >= 0 else "🔴 "
 
         with cols[idx]:
             st.markdown(
                 f"<div style='padding:14px;border-radius:10px;border:1px solid #d1d5db;background:#ffffff;'>"
-                f"<div style='font-size:18px;font-weight:800;color:#111827;margin-bottom:8px;'>{html.escape(str(nome_cor))}</div>"
+                f"<div style='font-size:18px;font-weight:800;color:#111827;margin-bottom:8px;'>{html.escape(str(nome_cor))} — Base: ${saldo_corretora:.2f} USDT</div>"
                 f"<div style='font-size:17px;font-weight:700;color:#065f46;background:#d1fae5;padding:6px 10px;border-radius:6px;margin-bottom:6px;'>"
                 f"🟢 Lucro: +$ {lucro_u:.4f} USDT (R$ {lucro_u * cotacao:.2f})</div>"
                 f"<div style='font-size:17px;font-weight:700;color:#991b1b;background:#fee2e2;padding:6px 10px;border-radius:6px;margin-bottom:6px;'>"
                 f"🔴 Loss: -$ {loss_u:.4f} USDT (-R$ {loss_u * cotacao:.2f})</div>"
                 f"<div style='font-size:16px;font-weight:700;color:#1f2937;'>"
-                f"Saldo: {sinal_saldo}$ {saldo_liq_u:.4f} USDT | Executadas: {ops_qtd}</div>"
+                f"Saldo Est.: ${saldo_atual_cor:.2f} | Liquido: {sinal_saldo}${saldo_liq_u:.4f} | Ops: {ops_qtd}</div>"
                 f"</div>",
                 unsafe_allow_html=True,
             )
 
 
-def renderizar_bloco_executor(executor: ExecutorArbitragem, cotacao: float):
+def renderizar_bloco_executor(executor: ExecutorArbitragem, cotacao: float, saldo_corretora: float):
     st.divider()
     st.subheader("Controle de Limites, Risco & Auditoria")
 
@@ -278,9 +291,8 @@ def renderizar_bloco_executor(executor: ExecutorArbitragem, cotacao: float):
             st.warning(f"⏸️ PARADA AUTOMATICA — {executor.motivo_trava}")
         else:
             st.info(
-                f"RODANDO AUTOMATICO — Ganho: +{meta_ganho_val:.2f} USDT | "
-                f"Perda: -{perda_max_val:.2f} USDT | "
-                f"Teto Ordens: {executor.ordens_executadas}/{max_ordens_val}"
+                f"RODANDO AUTOMATICO — Lote Giro: ${st.session_state.lote_dia_atual:.2f} USDT "
+                f"(Max/Ponta: ${saldo_corretora:.2f}) | Ganho: +${meta_ganho_val:.2f} | Perda: -${perda_max_val:.2f}"
             )
 
     with col_acao:
@@ -290,7 +302,7 @@ def renderizar_bloco_executor(executor: ExecutorArbitragem, cotacao: float):
             st.session_state.acum_usdt = 0.0
             st.session_state.custos_usdt = 0.0
             st.session_state.executadas_qtd = 0
-            st.session_state.lote_dia_atual = 180.0
+            st.session_state.lote_dia_atual = min(saldo_corretora / 2.0, float(executor.cfg.lote_maximo_usdt))
             st.session_state.auto_ativo = True
             st.session_state.linhas = []
             st.session_state.hist = []
@@ -341,7 +353,8 @@ def renderizar_bloco_executor(executor: ExecutorArbitragem, cotacao: float):
 def renderizar_painel(
     motor: MotorDadosArbitragem,
     executor: ExecutorArbitragem,
-    lote: float,
+    capital_total: float,
+    saldo_corretora: float,
     taxa_ponta: float,
     slippage: float,
     transf: float,
@@ -352,10 +365,10 @@ def renderizar_painel(
     executar: bool,
 ):
     if not st.session_state.hist and st.session_state.ciclo == 0:
-        st.session_state.hist = motor.historico_inicial(lote, taxa_ponta, slippage, transf)
+        st.session_state.hist = motor.historico_inicial(capital_total, taxa_ponta, slippage, transf)
 
     if executar or not st.session_state.linhas:
-        rodar_ciclo(motor, executor, lote, cotacao, atualizar_lote_fim_dia, pct_lote_dia)
+        rodar_ciclo(motor, executor, capital_total, saldo_corretora, cotacao, atualizar_lote_fim_dia, pct_lote_dia)
 
     st.caption(f"{motor.limiter.status_texto()} | Ciclo #{st.session_state.ciclo} | Auto: {'ON' if st.session_state.auto_ativo else 'OFF'}")
 
@@ -364,7 +377,7 @@ def renderizar_painel(
     total_loss_cor = sum(float(v.get("loss_usdt", 0.0)) for v in stats.values())
     acum_usdt = float(executor.pnl_acumulado_usdt)
     acum_brl = acum_usdt * cotacao
-    saldo_conta_estimado = lote + acum_usdt
+    saldo_conta_estimado = capital_total + acum_usdt
     sinal_acum = "🟢 +" if acum_usdt >= 0 else "🔴 "
 
     m1, m2, m3, m4 = st.columns(4)
@@ -372,12 +385,12 @@ def renderizar_painel(
     m2.metric("🟢 Lucro Executado", f"+$ {total_lucro_cor:.4f} USDT", f"R$ {total_lucro_cor * cotacao:.2f}")
     m3.metric("🔴 Loss Executado", f"-$ {total_loss_cor:.4f} USDT", f"-R$ {total_loss_cor * cotacao:.2f}")
     m4.metric(
-        "Saldo Liquido Sessao",
-        f"{sinal_acum}$ {acum_usdt:.4f}",
-        f"Conta: $ {saldo_conta_estimado:.2f} (R$ {acum_brl:.2f})",
+        "Saldo Total Estimado",
+        f"${saldo_conta_estimado:.2f} USDT",
+        f"{sinal_acum}${acum_usdt:.4f} (R$ {acum_brl:.2f})",
     )
 
-    renderizar_bloco_corretoras(cotacao)
+    renderizar_bloco_corretoras(cotacao, saldo_corretora)
 
     df_hist = pd.DataFrame(st.session_state.hist)
     if not df_hist.empty:
@@ -431,15 +444,24 @@ def renderizar_painel(
     else:
         st.info("Rodando em tempo real — aguardando nova operacao executada...")
 
-    renderizar_bloco_executor(executor, cotacao)
+    renderizar_bloco_executor(executor, cotacao, saldo_corretora)
 
 
 _init_state()
 
 with st.sidebar:
     st.header("Limites, Custos & Controles")
-    lote = st.number_input("Saldo Base / Lote Inicial (USDT)", min_value=20.0, value=180.0, step=20.0)
-    lote_max = st.number_input("Teto Lote / Giro (USDT)", min_value=15.0, value=90.0, step=5.0)
+    saldo_corretora = st.number_input("Saldo por Corretora (USDT)", min_value=15.0, value=81.0, step=1.0)
+    capital_total = round(saldo_corretora * 2.0, 2)
+    st.caption(f"Capital Total Calculado: **${capital_total:.2f} USDT** (${saldo_corretora:.2f} Binance + ${saldo_corretora:.2f} Bybit)")
+
+    lote_max = st.number_input(
+        "Teto Lote / Giro (USDT)",
+        min_value=15.0,
+        max_value=float(saldo_corretora),
+        value=min(40.5, float(saldo_corretora)),
+        step=0.5,
+    )
     meta_ganho = st.number_input("Limite de Ganho Sessao (USDT)", min_value=0.50, value=15.00, step=0.50)
     perda_max = st.number_input("Limite de Perda Sessao (USDT)", min_value=0.50, value=5.00, step=0.50)
     max_ordens = st.number_input("Max Ordens na Sessao", min_value=1, value=120, step=5)
@@ -462,7 +484,7 @@ with st.sidebar:
         st.session_state.acum_usdt = 0.0
         st.session_state.custos_usdt = 0.0
         st.session_state.executadas_qtd = 0
-        st.session_state.lote_dia_atual = lote
+        st.session_state.lote_dia_atual = min(saldo_corretora / 2.0, lote_max)
         st.session_state.auto_ativo = True
         st.session_state.linhas = []
         st.session_state.hist = []
@@ -470,7 +492,7 @@ with st.sidebar:
 
 motor = _obter_motor()
 executor = _obter_executor(
-    lote_max, meta_ganho, perda_max, max_ordens, taxa_ponta, slippage, transf, gatilho
+    capital_total, saldo_corretora, lote_max, meta_ganho, perda_max, max_ordens, taxa_ponta, slippage, transf, gatilho
 )
 
 if executor.travado_por_risco:
@@ -480,7 +502,8 @@ if executor.travado_por_risco:
 renderizar_painel(
     motor,
     executor,
-    lote,
+    capital_total,
+    saldo_corretora,
     taxa_ponta,
     slippage,
     transf,
