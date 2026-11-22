@@ -1,23 +1,14 @@
 import html
-import random
-from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
 from executor import ConfigRisco, ExecutorArbitragem
+from motor_dados import ControleRateLimit, MotorDadosArbitragem
 
 st.set_page_config(page_title="Arbitragem DRY_RUN — Painel Completo", layout="wide")
-st.title("🦅 Arbitragem DRY_RUN — Simulador, Risco e Auditoria")
-
-ATIVOS = [
-    ("SOL/USDT", "Bybit -> Binance", 98.50, 0.24),
-    ("BTC/USDT", "Binance -> Bybit", 64200.00, 0.16),
-    ("ETH/USDT", "Binance Spot/Fut", 2540.00, 0.12),
-    ("BNB/USDT", "BNB -> ETH -> USDT", 585.00, 0.08),
-    ("XRP/USDT", "Bybit Spot/Fut", 0.5400, 0.05),
-]
+st.title("Arbitragem DRY_RUN — Simulador, Risco e Auditoria")
 
 
 def _init_state():
@@ -27,12 +18,22 @@ def _init_state():
         "custos_usdt": 0.0,
         "simulados_qtd": 0,
         "pulados_qtd": 0,
+        "lote_dia_atual": 180.0,
         "linhas": [],
         "hist": [],
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
+
+
+def _obter_motor() -> MotorDadosArbitragem:
+    if "motor_dados" not in st.session_state:
+        st.session_state.motor_dados = MotorDadosArbitragem(
+            modo="observacao",
+            rate_limiter=ControleRateLimit(pausa_base=10.0, pausa_maxima=120.0),
+        )
+    return st.session_state.motor_dados
 
 
 def _obter_executor(
@@ -67,55 +68,42 @@ def _obter_executor(
     return ex
 
 
-def _garantir_historico_inicial(lote: float, taxa_ponta: float, slippage: float, transf: float):
-    if st.session_state.hist or st.session_state.ciclo > 0:
-        return
-    custo_pct = (taxa_ponta * 2.0) + slippage
-    acum_tmp = 0.0
-    for idx in range(1, 5):
-        for ativo, _, _, sp_base in ATIVOS:
-            sp_bruto = round(max(0.0, sp_base + (idx - 2.5) * 0.03), 4)
-            bruto_usdt = lote * (sp_bruto / 100.0)
-            custo_usdt = (lote * (custo_pct / 100.0)) + transf
-            liq_usdt = round(bruto_usdt - custo_usdt, 4)
-            sp_liq = round((liq_usdt / lote * 100.0) if lote > 0 else 0.0, 4)
-            if liq_usdt > 0:
-                acum_tmp = round(acum_tmp + liq_usdt, 4)
-            st.session_state.hist.append({
-                "Ciclo": idx,
-                "Ativo": ativo,
-                "Sp_Bruto_%": sp_bruto,
-                "Sp_Liq_%": sp_liq,
-                "Acumulado_USDT": acum_tmp,
-            })
-
-
 def rodar_ciclo(
+    motor: MotorDadosArbitragem,
     executor: ExecutorArbitragem,
-    lote: float,
-    taxa_ponta: float,
-    slippage: float,
-    transf: float,
+    lote_base: float,
     cotacao: float,
-    gatilho: float,
+    atualizar_lote_fim_dia: bool,
+    pct_lote_dia: float,
 ):
     st.session_state.ciclo += 1
     c_num = st.session_state.ciclo
-    hora = datetime.now().strftime("%H:%M:%S")
-    custo_pct = (taxa_ponta * 2.0) + slippage
     novas = []
 
-    for ativo, rota, preco_base, sp_base in ATIVOS:
-        preco = round(preco_base * (1.0 + random.uniform(-0.004, 0.004)), 4)
-        sp_bruto = round(max(0.0, sp_base + random.uniform(-0.06, 0.14)), 4)
-        lote_efetivo = min(lote, executor.cfg.lote_maximo_usdt)
+    lote_efetivo = min(float(st.session_state.lote_dia_atual), float(executor.cfg.lote_maximo_usdt))
+    cotacoes = motor.coletar_ciclo(motor.ATIVOS_PADRAO)
+
+    for cot in cotacoes:
+        if cot.status != "ok":
+            st.session_state.pulados_qtd += 1
+            novas.append({
+                "Tag": "PAUSA API",
+                "Ativo": cot.ativo,
+                "Sp_Liq": 0.0,
+                "Liq_USDT": 0.0,
+                "Liq_BRL": 0.0,
+                "Acao": "PAUSOU",
+                "bg": "#e5e7eb",
+                "fg": "#111827",
+            })
+            continue
 
         res = executor.avaliar_e_executar(
-            ativo=ativo,
-            rota=rota,
+            ativo=cot.ativo,
+            rota=cot.rota,
             lote_usdt=lote_efetivo,
-            spread_bruto_pct=sp_bruto,
-            saldo_disponivel_usdt=lote,
+            spread_bruto_pct=cot.spread_bruto_pct,
+            saldo_disponivel_usdt=max(lote_base, float(st.session_state.lote_dia_atual)),
         )
 
         custo_usdt = res.custos_totais_usdt
@@ -132,35 +120,36 @@ def rodar_ciclo(
             st.session_state.pulados_qtd += 1
 
         if liq_usdt <= 0:
-            bg, fg, tag = "#fee2e2", "#991b1b", "🔴 PREJUÍZO / ZERO"
+            bg, fg, tag = "#fee2e2", "#991b1b", "PREJUIZO / ZERO"
         elif liq_usdt >= 0.50:
-            bg, fg, tag = "#d1fae5", "#065f46", "🟢 LUCRO POSITIVO"
+            bg, fg, tag = "#d1fae5", "#065f46", "LUCRO POSITIVO"
         else:
-            bg, fg, tag = "#fef3c7", "#92400e", "🟡 MARGEM CURTA"
+            bg, fg, tag = "#fef3c7", "#92400e", "MARGEM CURTA"
 
         novas.append({
-            "Hora": hora,
             "Tag": tag,
-            "Ativo": ativo,
-            "Rota": rota,
-            "Preco": preco,
-            "Sp_Bruto": sp_bruto,
-            "Custo_USDT": round(custo_usdt, 4),
+            "Ativo": cot.ativo,
             "Sp_Liq": sp_liq,
             "Liq_USDT": liq_usdt,
             "Liq_BRL": liq_brl,
-            "Acao": "✅ SIMULOU" if atuou else "❌ PULOU",
+            "Acao": "SIMULOU" if atuou else "PULOU",
             "bg": bg,
             "fg": fg,
         })
 
         st.session_state.hist.append({
             "Ciclo": c_num,
-            "Ativo": ativo,
-            "Sp_Bruto_%": sp_bruto,
+            "Ativo": cot.ativo,
+            "Sp_Bruto_%": cot.spread_bruto_pct,
             "Sp_Liq_%": sp_liq,
             "Acumulado_USDT": st.session_state.acum_usdt,
         })
+
+    if atualizar_lote_fim_dia:
+        st.session_state.lote_dia_atual = executor.calcular_lote_fechamento_dia(
+            saldo_base_usdt=lote_base,
+            percentual_uso=pct_lote_dia,
+        )
 
     st.session_state.hist = st.session_state.hist[-250:]
     novas.sort(key=lambda x: x["Liq_USDT"], reverse=True)
@@ -169,29 +158,29 @@ def rodar_ciclo(
 
 def renderizar_bloco_executor(executor: ExecutorArbitragem, cotacao: float):
     st.divider()
-    st.subheader("🛡️ Controle de Risco & Auditoria (`ExecutorArbitragem`)")
+    st.subheader("Controle de Risco & Auditoria")
 
     col_status, col_acao = st.columns([3, 1])
     with col_status:
         if executor.travado_por_risco:
             st.error(
-                f"🚨 **CIRCUIT BREAKER ATIVO** — Novas ordens bloqueadas. "
-                f"Motivo: `{executor.motivo_trava}`"
+                f"CIRCUIT BREAKER ATIVO — Novas ordens bloqueadas. Motivo: {executor.motivo_trava}"
             )
         else:
             st.success(
-                f"🟢 **CIRCUIT BREAKER LIBERADO** — Modo: `{'DRY_RUN' if executor.cfg.dry_run else 'LIVE'}` | "
-                f"Limite de perda: `-{executor.cfg.perda_maxima_sessao_usdt:.2f} USDT`"
+                f"CIRCUIT BREAKER LIBERADO — Modo: {'DRY_RUN' if executor.cfg.dry_run else 'LIVE'} | "
+                f"Limite de perda: -{executor.cfg.perda_maxima_sessao_usdt:.2f} USDT"
             )
 
     with col_acao:
-        if st.button("🔓 Resetar Trava / Sessão", use_container_width=True):
+        if st.button("Resetar Trava / Sessao", use_container_width=True):
             executor.resetar_sessao()
             st.session_state.ciclo = 0
             st.session_state.acum_usdt = 0.0
             st.session_state.custos_usdt = 0.0
             st.session_state.simulados_qtd = 0
             st.session_state.pulados_qtd = 0
+            st.session_state.lote_dia_atual = 180.0
             st.session_state.linhas = []
             st.session_state.hist = []
             st.rerun()
@@ -209,7 +198,7 @@ def renderizar_bloco_executor(executor: ExecutorArbitragem, cotacao: float):
     )
     e3.metric("Ordens / Ciclos Aprovados", executor.ordens_executadas)
 
-    st.markdown("#### 📄 Histórico de Auditoria (`logs/execucoes_auditoria.csv`)")
+    st.markdown("#### Historico de Auditoria (`logs/execucoes_auditoria.csv`)")
     caminho_csv: Path = executor.arquivo_csv
 
     if caminho_csv.exists():
@@ -222,59 +211,65 @@ def renderizar_bloco_executor(executor: ExecutorArbitragem, cotacao: float):
                     hide_index=True,
                 )
             else:
-                st.info("O arquivo CSV existe, mas ainda não há execuções registradas.")
+                st.info("O arquivo CSV existe, mas ainda nao ha execucoes registradas.")
         except Exception as exc:
-            st.warning(f"Não foi possível ler o CSV agora: {exc}")
+            st.warning(f"Nao foi possivel ler o CSV agora: {exc}")
     else:
         st.info("Nenhum log CSV gerado ainda em `logs/execucoes_auditoria.csv`.")
 
 
 def renderizar_painel(
+    motor: MotorDadosArbitragem,
     executor: ExecutorArbitragem,
     lote: float,
     taxa_ponta: float,
     slippage: float,
     transf: float,
     cotacao: float,
-    gatilho: float,
     ativo_foco: str,
+    atualizar_lote_fim_dia: bool,
+    pct_lote_dia: float,
     executar: bool,
 ):
-    _garantir_historico_inicial(lote, taxa_ponta, slippage, transf)
+    if not st.session_state.hist and st.session_state.ciclo == 0:
+        st.session_state.hist = motor.historico_inicial(lote, taxa_ponta, slippage, transf)
+
     if executar or not st.session_state.linhas:
-        rodar_ciclo(executor, lote, taxa_ponta, slippage, transf, cotacao, gatilho)
+        rodar_ciclo(motor, executor, lote, cotacao, atualizar_lote_fim_dia, pct_lote_dia)
+
+    st.caption(motor.limiter.status_texto())
 
     acum_brl = st.session_state.acum_usdt * cotacao
     custos_brl = st.session_state.custos_usdt * cotacao
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Ciclos Rodados", f"#{st.session_state.ciclo}")
-    m2.metric("Lucro Líquido Simulado", f"$ {st.session_state.acum_usdt:.4f} USDT", f"R$ {acum_brl:.2f}")
+    m2.metric("Lucro Liquido Simulado", f"$ {st.session_state.acum_usdt:.4f} USDT", f"R$ {acum_brl:.2f}")
     m3.metric("Custos Descontados", f"$ {st.session_state.custos_usdt:.4f} USDT", f"R$ {custos_brl:.2f}")
-    m4.metric("Lote Configurado", f"$ {lote:.0f} USDT", f"~R$ {lote * cotacao:.2f}")
+    m4.metric("Lote Dia / Teto", f"$ {st.session_state.lote_dia_atual:.2f}", f"Teto: $ {executor.cfg.lote_maximo_usdt:.2f}")
 
     total_ops = st.session_state.simulados_qtd + st.session_state.pulados_qtd
     pct_puladas = (st.session_state.pulados_qtd / total_ops * 100.0) if total_ops > 0 else 0.0
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("✅ SIMULOU", st.session_state.simulados_qtd)
-    c2.metric("❌ PULOU (Custo/Gatilho)", st.session_state.pulados_qtd, f"{pct_puladas:.1f}% do total")
-    c3.metric("📊 Total Avaliado", total_ops)
+    c1.metric("SIMULOU", st.session_state.simulados_qtd)
+    c2.metric("PULOU (Custo/Gatilho)", st.session_state.pulados_qtd, f"{pct_puladas:.1f}% do total")
+    c3.metric("Total Avaliado", total_ops)
 
     df_hist = pd.DataFrame(st.session_state.hist)
     if not df_hist.empty:
         df_a = df_hist[df_hist["Ativo"] == ativo_foco].set_index("Ciclo")
         if not df_a.empty:
-            st.subheader(f"📈 Spread Bruto vs. Spread Líquido Real — {ativo_foco}")
+            st.subheader(f"Spread Bruto vs. Spread Liquido Real — {ativo_foco}")
             g1, g2 = st.columns(2)
             with g1:
-                st.caption("Spread Bruto (%) vs. Spread Líquido após Custos (%)")
+                st.caption("Spread Bruto (%) vs. Spread Liquido apos Custos (%)")
                 st.line_chart(df_a[["Sp_Bruto_%", "Sp_Liq_%"]], height=230)
             with g2:
-                st.caption("Lucro Líquido Acumulado Simulado (USDT)")
+                st.caption("Lucro Liquido Acumulado Simulado (USDT)")
                 st.line_chart(df_a[["Acumulado_USDT"]], height=230)
 
-    st.subheader("🎯 Radar & Execuções do Ciclo (Colunas Principais)")
+    st.subheader("Radar & Execucoes do Ciclo")
     trs = []
     for r in st.session_state.linhas:
         trs.append(
@@ -294,9 +289,9 @@ def renderizar_painel(
         "<tr style='background:#1f2937;color:#ffffff;font-size:16px;'>"
         "<th style='padding:11px 10px;text-align:left;'>Qualidade</th>"
         "<th style='padding:11px 10px;text-align:left;'>Ativo</th>"
-        "<th style='padding:11px 10px;text-align:left;'>Sp. Líquido</th>"
-        "<th style='padding:11px 10px;text-align:left;'>Lucro Líquido</th>"
-        "<th style='padding:11px 10px;text-align:left;'>Decisão</th>"
+        "<th style='padding:11px 10px;text-align:left;'>Sp. Liquido</th>"
+        "<th style='padding:11px 10px;text-align:left;'>Lucro Liquido</th>"
+        "<th style='padding:11px 10px;text-align:left;'>Decisao</th>"
         "</tr>"
         "</thead>"
         "<tbody>" + "".join(trs) + "</tbody>"
@@ -311,53 +306,77 @@ def renderizar_painel(
 _init_state()
 
 with st.sidebar:
-    st.header("⚙️ Custos, Risco & Controles")
-    lote = st.number_input("Lote por Giro (USDT)", min_value=20.0, value=180.0, step=20.0)
+    st.header("Custos, Risco & Controles")
+    lote = st.number_input("Saldo Base / Lote Inicial (USDT)", min_value=20.0, value=180.0, step=20.0)
     lote_max = st.number_input("Teto Lote / Giro (USDT)", min_value=15.0, value=90.0, step=5.0)
-    perda_max = st.number_input("Stop-Loss Sessão (USDT)", min_value=0.50, value=5.40, step=0.50)
-    cotacao = st.number_input("Cotação R$ / USDT", min_value=1.0, value=5.50, step=0.10)
+    perda_max = st.number_input("Stop-Loss Sessao (USDT)", min_value=0.50, value=5.40, step=0.50)
+    cotacao = st.number_input("Cotacao R$ / USDT", min_value=1.0, value=5.50, step=0.10)
     taxa_ponta = st.number_input("Taxa por Ponta (%)", min_value=0.0, value=0.10, step=0.01, format="%.3f")
     slippage = st.number_input("Slippage Total (%)", min_value=0.0, value=0.04, step=0.01, format="%.3f")
-    transf = st.number_input("Taxa Transferência (USDT)", min_value=0.0, value=0.00, step=0.25, format="%.2f")
-    gatilho = st.number_input("Gatilho Líquido Mínimo (%)", min_value=0.0, value=0.02, step=0.01, format="%.2f")
-    ativo_foco = st.selectbox("Ativo no Gráfico", [a[0] for a in ATIVOS], index=0)
+    transf = st.number_input("Taxa Transferencia (USDT)", min_value=0.0, value=0.00, step=0.25, format="%.2f")
+    gatilho = st.number_input("Gatilho Liquido Minimo (%)", min_value=0.0, value=0.02, step=0.01, format="%.2f")
+    atualizar_lote_fim_dia = st.toggle("Atualizar Lote no Final do Dia", value=True)
+    pct_lote_dia = st.slider("% do Saldo no Giro", min_value=10, max_value=100, value=50, step=5) / 100.0
+    ativo_foco = st.selectbox("Ativo no Grafico", [a[0] for a in MotorDadosArbitragem.ATIVOS_PADRAO], index=0)
 
     st.divider()
-    auto_rodar = st.toggle("▶️ Auto-Ciclo Leve", value=False)
+    auto_rodar = st.toggle("Auto-Ciclo Leve", value=False)
     segundos = st.slider("Intervalo (seg)", min_value=2, max_value=15, value=4)
 
-    if st.button("🧹 Zerar Tudo"):
+    if st.button("Zerar Tudo"):
         st.session_state.ciclo = 0
         st.session_state.acum_usdt = 0.0
         st.session_state.custos_usdt = 0.0
         st.session_state.simulados_qtd = 0
         st.session_state.pulados_qtd = 0
+        st.session_state.lote_dia_atual = lote
         st.session_state.linhas = []
         st.session_state.hist = []
 
+motor = _obter_motor()
 executor = _obter_executor(lote_max, perda_max, taxa_ponta, slippage, transf, gatilho)
 
 b1, b2 = st.columns([2, 2])
 with b1:
-    rodar_1 = st.button("🔄 Rodar 1 Ciclo", type="primary", disabled=auto_rodar)
+    rodar_1 = st.button("Rodar 1 Ciclo", type="primary", disabled=auto_rodar)
 with b2:
-    rodar_10 = st.button("⚡ Simular 10 Ciclos", disabled=auto_rodar)
+    rodar_10 = st.button("Simular 10 Ciclos", disabled=auto_rodar)
 
 if rodar_10 and not auto_rodar:
     for _ in range(10):
-        rodar_ciclo(executor, lote, taxa_ponta, slippage, transf, cotacao, gatilho)
+        rodar_ciclo(motor, executor, lote, cotacao, atualizar_lote_fim_dia, pct_lote_dia)
 
 if auto_rodar:
-    st.caption(f"🟢 Auto-ciclo ativo a cada **{segundos}s**.")
+    st.caption(f"Auto-ciclo ativo a cada {segundos}s.")
 
     @st.fragment(run_every=segundos)
     def painel_vivo():
         renderizar_painel(
-            executor, lote, taxa_ponta, slippage, transf, cotacao, gatilho, ativo_foco, executar=True
+            motor,
+            executor,
+            lote,
+            taxa_ponta,
+            slippage,
+            transf,
+            cotacao,
+            ativo_foco,
+            atualizar_lote_fim_dia,
+            pct_lote_dia,
+            executar=True,
         )
 
     painel_vivo()
 else:
     renderizar_painel(
-        executor, lote, taxa_ponta, slippage, transf, cotacao, gatilho, ativo_foco, executar=rodar_1
+        motor,
+        executor,
+        lote,
+        taxa_ponta,
+        slippage,
+        transf,
+        cotacao,
+        ativo_foco,
+        atualizar_lote_fim_dia,
+        pct_lote_dia,
+        executar=rodar_1,
     )
