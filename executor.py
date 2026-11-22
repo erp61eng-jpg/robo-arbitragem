@@ -16,7 +16,7 @@ class ConfigRisco:
     lote_minimo_usdt: float = 15.0
     lote_maximo_usdt: float = 90.0
     meta_ganho_sessao_usdt: float = 15.0
-    perda_maxima_sessao_usdt: float = 5.40
+    perda_maxima_sessao_usdt: float = 5.0
     gatilho_spread_liq_pct: float = 0.05
     max_ordens_sessao: int = 120
 
@@ -59,7 +59,7 @@ class ExecutorArbitragem:
         self.custos_acumulados_usdt: float = 0.0
         self.ordens_executadas: int = 0
         self.travado_por_risco: bool = False
-        self.status_meta: str = "EM_ANDAMENTO"  # EM_ANDAMENTO | META_GANHO_ATINGIDA | STOP_LOSS_ATINGIDO
+        self.status_meta: str = "EM_ANDAMENTO"
         self.motivo_trava: str = ""
 
         self._carregar_estado()
