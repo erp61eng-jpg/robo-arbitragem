@@ -10,13 +10,11 @@ class CotacaoPar:
     rota: str
     preco_ref: float
     spread_bruto_pct: float
-    status: str  # "ok" | "pausado" | "rate_limit" | "erro_rede"
+    status: str
     mensagem: str = ""
 
 
 class ControleRateLimit:
-    """Controla pausas progressivas caso a API retorne limite (429/418) ou falha de rede."""
-
     def __init__(self, pausa_base: float = 10.0, pausa_maxima: float = 120.0):
         self.pausa_base = float(pausa_base)
         self.pausa_maxima = float(pausa_maxima)
@@ -48,13 +46,11 @@ class ControleRateLimit:
     def status_texto(self) -> str:
         permitido, restante = self.pode_chamar()
         if permitido:
-            return "🟢 API / Motor Livre"
-        return f"⏸️ Em pausa por limite/rede ({restante:.1f}s restantes)"
+            return "Motor em modo observacao livre"
+        return f"Em pausa por limite/rede ({restante:.1f}s restantes)"
 
 
 class MotorDadosArbitragem:
-    """Fornece leituras em modo observação (DRY_RUN) com suporte a controle de rate limit."""
-
     ATIVOS_PADRAO = [
         ("SOL/USDT", "Bybit -> Binance", 98.50, 0.24),
         ("BTC/USDT", "Binance -> Bybit", 64200.00, 0.16),
@@ -67,33 +63,16 @@ class MotorDadosArbitragem:
         self,
         modo: str = "observacao",
         rate_limiter: Optional[ControleRateLimit] = None,
-        simular_rate_limit_a_cada: int = 0,
     ):
-        self.modo = modo  # "observacao" (padrão seguro)
+        self.modo = modo
         self.limiter = rate_limiter if rate_limiter is not None else ControleRateLimit()
-        self.simular_rate_limit_a_cada = int(simular_rate_limit_a_cada)
-        self.leituras_feitas: int = 0
 
-    def coletar_ciclo(self, ativos: Optional[List[Tuple[str, str, float, float]]] = None) -> List[CotacaoPar]:
+    def coletar_ciclo(
+        self, ativos: Optional[List[Tuple[str, str, float, float]]] = None
+    ) -> List[CotacaoPar]:
         lista_ativos = ativos if ativos is not None else self.ATIVOS_PADRAO
-        self.leituras_feitas += 1
-
-        # Opcional: simula resposta 429 periódica em modo observação para testar a pausa automática
-        if self.simular_rate_limit_a_cada > 0 and (self.leituras_feitas % self.simular_rate_limit_a_cada == 0):
-            espera = self.limiter.registrar_limite()
-            return [
-                CotacaoPar(
-                    ativo=ativo,
-                    rota=rota,
-                    preco_ref=preco_base,
-                    spread_bruto_pct=0.0,
-                    status="rate_limit",
-                    mensagem=f"Limite simulado (429): pausa de {espera:.1f}s",
-                )
-                for ativo, rota, preco_base, _ in lista_ativos
-            ]
-
         permitido, restante = self.limiter.pode_chamar()
+
         if not permitido:
             return [
                 CotacaoPar(
@@ -125,7 +104,9 @@ class MotorDadosArbitragem:
         self.limiter.registrar_sucesso()
         return resultados
 
-    def historico_inicial(self, lote: float, taxa_ponta: float, slippage: float, transf: float) -> List[Dict]:
+    def historico_inicial(
+        self, lote: float, taxa_ponta: float, slippage: float, transf: float
+    ) -> List[Dict]:
         custo_pct = (taxa_ponta * 2.0) + slippage
         acum_tmp = 0.0
         linhas_hist: List[Dict] = []
