@@ -15,9 +15,10 @@ class ConfigRisco:
     capital_referencia_usdt: float = 180.0
     lote_minimo_usdt: float = 15.0
     lote_maximo_usdt: float = 90.0
+    meta_ganho_sessao_usdt: float = 15.0
     perda_maxima_sessao_usdt: float = 5.40
     gatilho_spread_liq_pct: float = 0.05
-    max_ordens_sessao: int = 30
+    max_ordens_sessao: int = 120
 
     taxa_ponta_pct: float = 0.10
     slippage_total_pct: float = 0.05
@@ -58,6 +59,7 @@ class ExecutorArbitragem:
         self.custos_acumulados_usdt: float = 0.0
         self.ordens_executadas: int = 0
         self.travado_por_risco: bool = False
+        self.status_meta: str = "EM_ANDAMENTO"  # EM_ANDAMENTO | META_GANHO_ATINGIDA | STOP_LOSS_ATINGIDO
         self.motivo_trava: str = ""
 
         self._carregar_estado()
@@ -81,6 +83,7 @@ class ExecutorArbitragem:
                 self.custos_acumulados_usdt = float(dados.get("custos_acumulados_usdt", 0.0))
                 self.ordens_executadas = int(dados.get("ordens_executadas", 0))
                 self.travado_por_risco = bool(dados.get("travado_por_risco", False))
+                self.status_meta = str(dados.get("status_meta", "EM_ANDAMENTO"))
                 self.motivo_trava = str(dados.get("motivo_trava", ""))
             except Exception:
                 pass
@@ -93,6 +96,7 @@ class ExecutorArbitragem:
             "custos_acumulados_usdt": round(self.custos_acumulados_usdt, 4),
             "ordens_executadas": self.ordens_executadas,
             "travado_por_risco": self.travado_por_risco,
+            "status_meta": self.status_meta,
             "motivo_trava": self.motivo_trava,
         }
         self.arquivo_estado.write_text(
@@ -105,8 +109,24 @@ class ExecutorArbitragem:
         self.custos_acumulados_usdt = 0.0
         self.ordens_executadas = 0
         self.travado_por_risco = False
+        self.status_meta = "EM_ANDAMENTO"
         self.motivo_trava = ""
         self._salvar_estado()
+
+    def _avaliar_limites_sessao(self) -> bool:
+        if self.cfg.perda_maxima_sessao_usdt > 0 and self.pnl_acumulado_usdt <= -abs(self.cfg.perda_maxima_sessao_usdt):
+            self.travado_por_risco = True
+            self.status_meta = "STOP_LOSS_ATINGIDO"
+            self.motivo_trava = f"Limite de perda atingido ({self.pnl_acumulado_usdt:.4f} USDT)"
+            return True
+
+        if self.cfg.meta_ganho_sessao_usdt > 0 and self.pnl_acumulado_usdt >= abs(self.cfg.meta_ganho_sessao_usdt):
+            self.travado_por_risco = True
+            self.status_meta = "META_GANHO_ATINGIDA"
+            self.motivo_trava = f"Limite de ganho atingido ({self.pnl_acumulado_usdt:.4f} USDT)"
+            return True
+
+        return False
 
     def calcular_lote_fechamento_dia(
         self,
@@ -178,13 +198,8 @@ class ExecutorArbitragem:
             self._salvar_estado()
             return res
 
-        if self.travado_por_risco:
-            return bloquear("CIRCUIT BREAKER ATIVO: " + self.motivo_trava)
-
-        if self.pnl_acumulado_usdt <= -abs(self.cfg.perda_maxima_sessao_usdt):
-            self.travado_por_risco = True
-            self.motivo_trava = f"Perda maxima atingida ({self.pnl_acumulado_usdt:.4f} USDT)"
-            return bloquear(self.motivo_trava)
+        if self._avaliar_limites_sessao() or self.travado_por_risco:
+            return bloquear("PARADA AUTOMATICA: " + (self.motivo_trava or "Limite atingido"))
 
         if self.ordens_executadas >= self.cfg.max_ordens_sessao:
             return bloquear(f"Limite maximo de {self.cfg.max_ordens_sessao} ordens atingido na sessao.")
@@ -207,6 +222,7 @@ class ExecutorArbitragem:
             self.pnl_acumulado_usdt = round(self.pnl_acumulado_usdt + lucro_liq_usdt, 4)
             self.custos_acumulados_usdt = round(self.custos_acumulados_usdt + custos_usdt, 4)
             self.ordens_executadas += 1
+            self._avaliar_limites_sessao()
             self._salvar_estado()
 
             res = ResultadoExecucao(
@@ -241,11 +257,7 @@ class ExecutorArbitragem:
             self.pnl_acumulado_usdt = round(self.pnl_acumulado_usdt + pnl_real_usdt, 4)
             self.custos_acumulados_usdt = round(self.custos_acumulados_usdt + custo_real_usdt, 4)
             self.ordens_executadas += 1
-
-            if self.pnl_acumulado_usdt <= -abs(self.cfg.perda_maxima_sessao_usdt):
-                self.travado_por_risco = True
-                self.motivo_trava = f"Stop-loss atingido apos ordem real ({self.pnl_acumulado_usdt:.4f} USDT)"
-
+            self._avaliar_limites_sessao()
             self._salvar_estado()
 
             res = ResultadoExecucao(
@@ -266,5 +278,6 @@ class ExecutorArbitragem:
 
         except Exception as exc:
             self.travado_por_risco = True
+            self.status_meta = "STOP_LOSS_ATINGIDO"
             self.motivo_trava = f"Falha na execucao real: {exc}"
             return bloquear(self.motivo_trava)
