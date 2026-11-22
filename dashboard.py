@@ -8,8 +8,8 @@ import streamlit as st
 from executor import ConfigRisco, ExecutorArbitragem
 from motor_dados import ControleRateLimit, MotorDadosArbitragem
 
-st.set_page_config(page_title="Arbitragem Automatica — Operacoes Realizadas", layout="wide")
-st.title("Arbitragem Automatica — Somente Operacoes Realizadas")
+st.set_page_config(page_title="Arbitragem Automatica — Somente Executadas", layout="wide")
+st.title("Arbitragem Automatica — Rodando & Contabilizando Apenas Executadas")
 
 
 def _stats_padrao() -> dict:
@@ -24,7 +24,7 @@ def _init_state():
         "ciclo": 0,
         "acum_usdt": 0.0,
         "custos_usdt": 0.0,
-        "realizadas_qtd": 0,
+        "executadas_qtd": 0,
         "lote_dia_atual": 180.0,
         "auto_ativo": True,
         "linhas": [],
@@ -78,7 +78,6 @@ def _obter_executor(
     meta_ganho: float,
     perda_max: float,
     max_ordens: int,
-    max_sem_op: int,
     taxa_ponta: float,
     slippage: float,
     transf: float,
@@ -92,7 +91,7 @@ def _obter_executor(
         "meta_ganho_sessao_usdt": meta_ganho,
         "perda_maxima_sessao_usdt": perda_max,
         "max_ordens_sessao": max_ordens,
-        "max_ciclos_sem_oportunidade": max_sem_op,
+        "max_ciclos_sem_oportunidade": 999999,
         "gatilho_spread_liq_pct": gatilho,
         "taxa_ponta_pct": taxa_ponta,
         "slippage_total_pct": slippage,
@@ -110,6 +109,13 @@ def _obter_executor(
     if not hasattr(ex, "status_meta"):
         ex.status_meta = "EM_ANDAMENTO"
     if not hasattr(ex, "ciclos_sem_oportunidade"):
+        ex.ciclos_sem_oportunidade = 0
+
+    # Se havia trava antiga apenas por falta de oportunidade, libera para continuar rodando
+    if getattr(ex, "status_meta", "") == "SEM_OPORTUNIDADE":
+        ex.travado_por_risco = False
+        ex.status_meta = "EM_ANDAMENTO"
+        ex.motivo_trava = ""
         ex.ciclos_sem_oportunidade = 0
 
     if hasattr(ex, "_avaliar_limites_sessao"):
@@ -134,8 +140,7 @@ def rodar_ciclo(
 
     st.session_state.ciclo += 1
     c_num = st.session_state.ciclo
-    novas_realizadas = []
-    teve_oportunidade_no_ciclo = False
+    novas_executadas = []
 
     lote_efetivo = min(float(st.session_state.lote_dia_atual), float(executor.cfg.lote_maximo_usdt))
     cotacoes = motor.coletar_ciclo(motor.ATIVOS_PADRAO)
@@ -160,16 +165,15 @@ def rodar_ciclo(
             saldo_disponivel_usdt=max(lote_base, float(st.session_state.lote_dia_atual)),
         )
 
-        atuou = res.decisao in ("EXECUTADO_DRY_RUN", "EXECUTADO_LIVE")
-        if not atuou:
+        # Contabiliza e exibe EXCLUSIVAMENTE o que foi executado
+        if res.decisao not in ("EXECUTADO_DRY_RUN", "EXECUTADO_LIVE"):
             continue
 
-        teve_oportunidade_no_ciclo = True
         sp_liq = res.spread_liquido_pct
         liq_usdt = res.lucro_liquido_est_usdt
         liq_brl = round(liq_usdt * cotacao, 2)
 
-        st.session_state.realizadas_qtd += 1
+        st.session_state.executadas_qtd += 1
         st.session_state.acum_usdt = executor.pnl_acumulado_usdt
         st.session_state.custos_usdt = executor.custos_acumulados_usdt
         st.session_state.stats_corretoras[corretora]["ops"] += 1
@@ -185,14 +189,14 @@ def rodar_ciclo(
             )
             bg, fg, tag = "#fee2e2", "#991b1b", "🔴 LOSS"
 
-        novas_realizadas.append({
+        novas_executadas.append({
             "Tag": tag,
             "Ativo": cot.ativo,
             "Corretora": corretora,
             "Sp_Liq": sp_liq,
             "Liq_USDT": liq_usdt,
             "Liq_BRL": liq_brl,
-            "Acao": "REALIZADA",
+            "Acao": "EXECUTADA",
             "bg": bg,
             "fg": fg,
         })
@@ -205,9 +209,6 @@ def rodar_ciclo(
             "Acumulado_USDT": st.session_state.acum_usdt,
         })
 
-    if not teve_oportunidade_no_ciclo and not executor.travado_por_risco and hasattr(executor, "registrar_ciclo_sem_oportunidade"):
-        executor.registrar_ciclo_sem_oportunidade()
-
     if executor.travado_por_risco:
         st.session_state.auto_ativo = False
 
@@ -218,13 +219,13 @@ def rodar_ciclo(
         )
 
     st.session_state.hist = st.session_state.hist[-250:]
-    if novas_realizadas:
-        novas_realizadas.sort(key=lambda x: x["Liq_USDT"], reverse=True)
-        st.session_state.linhas = (novas_realizadas + st.session_state.linhas)[:60]
+    if novas_executadas:
+        novas_executadas.sort(key=lambda x: x["Liq_USDT"], reverse=True)
+        st.session_state.linhas = (novas_executadas + st.session_state.linhas)[:80]
 
 
 def renderizar_bloco_corretoras(cotacao: float):
-    st.subheader("🟢 Lucro e 🔴 Loss por Corretora (Operacoes Realizadas)")
+    st.subheader("🟢 Lucro e 🔴 Loss por Corretora (Apenas Executadas)")
     stats = st.session_state.get("stats_corretoras") or _stats_padrao()
     nomes = list(stats.keys()) or ["Binance", "Bybit"]
     cols = st.columns(len(nomes))
@@ -246,7 +247,7 @@ def renderizar_bloco_corretoras(cotacao: float):
                 f"<div style='font-size:17px;font-weight:700;color:#991b1b;background:#fee2e2;padding:6px 10px;border-radius:6px;margin-bottom:6px;'>"
                 f"🔴 Loss: -$ {loss_u:.4f} USDT (-R$ {loss_u * cotacao:.2f})</div>"
                 f"<div style='font-size:16px;font-weight:700;color:#1f2937;'>"
-                f"Saldo: {sinal_saldo}$ {saldo_liq_u:.4f} USDT | Realizadas: {ops_qtd}</div>"
+                f"Saldo: {sinal_saldo}$ {saldo_liq_u:.4f} USDT | Executadas: {ops_qtd}</div>"
                 f"</div>",
                 unsafe_allow_html=True,
             )
@@ -260,8 +261,6 @@ def renderizar_bloco_executor(executor: ExecutorArbitragem, cotacao: float):
     meta_ganho_val = float(getattr(executor.cfg, "meta_ganho_sessao_usdt", 15.0))
     perda_max_val = float(getattr(executor.cfg, "perda_maxima_sessao_usdt", 5.0))
     max_ordens_val = int(getattr(executor.cfg, "max_ordens_sessao", 120))
-    max_sem_op_val = int(getattr(executor.cfg, "max_ciclos_sem_oportunidade", 15))
-    sem_op_atual = int(getattr(executor, "ciclos_sem_oportunidade", 0))
 
     col_status, col_acao = st.columns([3, 1])
     with col_status:
@@ -269,13 +268,13 @@ def renderizar_bloco_executor(executor: ExecutorArbitragem, cotacao: float):
             st.success(f"🟢 PARADA AUTOMATICA — LIMITE DE GANHO ATINGIDO: {executor.motivo_trava}")
         elif status_meta == "STOP_LOSS_ATINGIDO":
             st.error(f"🔴 PARADA AUTOMATICA — LIMITE DE PERDA ATINGIDO: {executor.motivo_trava}")
-        elif status_meta in ("LIMITE_ORDENS_ATINGIDO", "SEM_OPORTUNIDADE"):
+        elif status_meta == "LIMITE_ORDENS_ATINGIDO":
             st.warning(f"⏸️ PARADA AUTOMATICA — {executor.motivo_trava}")
         else:
             st.info(
-                f"OPERACAO AUTOMATICA ATIVA — Ganho: +{meta_ganho_val:.2f} | "
-                f"Perda: -{perda_max_val:.2f} | "
-                f"Sem op.: {sem_op_atual}/{max_sem_op_val}"
+                f"RODANDO AUTOMATICO — Ganho: +{meta_ganho_val:.2f} USDT | "
+                f"Perda: -{perda_max_val:.2f} USDT | "
+                f"Teto Ordens: {executor.ordens_executadas}/{max_ordens_val}"
             )
 
     with col_acao:
@@ -284,7 +283,7 @@ def renderizar_bloco_executor(executor: ExecutorArbitragem, cotacao: float):
             st.session_state.ciclo = 0
             st.session_state.acum_usdt = 0.0
             st.session_state.custos_usdt = 0.0
-            st.session_state.realizadas_qtd = 0
+            st.session_state.executadas_qtd = 0
             st.session_state.lote_dia_atual = 180.0
             st.session_state.auto_ativo = True
             st.session_state.linhas = []
@@ -295,7 +294,7 @@ def renderizar_bloco_executor(executor: ExecutorArbitragem, cotacao: float):
     e1, e2, e3 = st.columns(3)
     sinal_pnl = "🟢 +" if executor.pnl_acumulado_usdt >= 0 else "🔴 "
     e1.metric(
-        "PnL Acumulado (Sessao)",
+        "PnL Acumulado (Executadas)",
         f"{sinal_pnl}$ {executor.pnl_acumulado_usdt:.4f} USDT",
         f"R$ {executor.pnl_acumulado_usdt * cotacao:.2f}",
     )
@@ -305,26 +304,26 @@ def renderizar_bloco_executor(executor: ExecutorArbitragem, cotacao: float):
         f"R$ {executor.custos_acumulados_usdt * cotacao:.2f}",
     )
     e3.metric(
-        "Operacoes Realizadas",
+        "Ordens Executadas",
         f"{executor.ordens_executadas}/{max_ordens_val}",
     )
 
-    st.markdown("#### Historico de Auditoria (`logs/execucoes_auditoria.csv`)")
+    st.markdown("#### Historico de Auditoria (`logs/execucoes_auditoria.csv` — Apenas Executadas)")
     caminho_csv: Path = executor.arquivo_csv
 
     if caminho_csv.exists():
         try:
             df_log = pd.read_csv(caminho_csv)
-            if not df_log.empty:
-                df_real = df_log[df_log["decisao"].isin(["EXECUTADO_DRY_RUN", "EXECUTADO_LIVE"])]
-                if not df_real.empty:
+            if not df_log.empty and "decisao" in df_log.columns:
+                df_exec = df_log[df_log["decisao"].isin(["EXECUTADO_DRY_RUN", "EXECUTADO_LIVE"])]
+                if not df_exec.empty:
                     st.dataframe(
-                        df_real.tail(30).iloc[::-1],
+                        df_exec.tail(30).iloc[::-1],
                         use_container_width=True,
                         hide_index=True,
                     )
                 else:
-                    st.info("Nenhuma operacao realizada registrada no CSV ainda.")
+                    st.info("Nenhuma operacao executada registrada no CSV ainda.")
             else:
                 st.info("O arquivo CSV existe, mas ainda nao ha execucoes registradas.")
         except Exception as exc:
@@ -352,7 +351,7 @@ def renderizar_painel(
     if executar or not st.session_state.linhas:
         rodar_ciclo(motor, executor, lote, cotacao, atualizar_lote_fim_dia, pct_lote_dia)
 
-    st.caption(motor.limiter.status_texto())
+    st.caption(f"{motor.limiter.status_texto()} | Ciclo #{st.session_state.ciclo} | Auto: {'ON' if st.session_state.auto_ativo else 'OFF'}")
 
     stats = st.session_state.get("stats_corretoras") or _stats_padrao()
     total_lucro_cor = sum(float(v.get("lucro_usdt", 0.0)) for v in stats.values())
@@ -363,9 +362,9 @@ def renderizar_painel(
     sinal_acum = "🟢 +" if acum_usdt >= 0 else "🔴 "
 
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Operacoes Realizadas", f"{st.session_state.realizadas_qtd}")
-    m2.metric("🟢 Lucro Realizado", f"+$ {total_lucro_cor:.4f} USDT", f"R$ {total_lucro_cor * cotacao:.2f}")
-    m3.metric("🔴 Loss Realizado", f"-$ {total_loss_cor:.4f} USDT", f"-R$ {total_loss_cor * cotacao:.2f}")
+    m1.metric("Operacoes Executadas", f"{st.session_state.executadas_qtd}")
+    m2.metric("🟢 Lucro Executado", f"+$ {total_lucro_cor:.4f} USDT", f"R$ {total_lucro_cor * cotacao:.2f}")
+    m3.metric("🔴 Loss Executado", f"-$ {total_loss_cor:.4f} USDT", f"-R$ {total_loss_cor * cotacao:.2f}")
     m4.metric(
         "Saldo Liquido Sessao",
         f"{sinal_acum}$ {acum_usdt:.4f}",
@@ -378,7 +377,7 @@ def renderizar_painel(
     if not df_hist.empty:
         df_a = df_hist[df_hist["Ativo"] == ativo_foco].set_index("Ciclo")
         if not df_a.empty:
-            st.subheader(f"Spread Bruto vs. Spread Liquido Real — {ativo_foco}")
+            st.subheader(f"Spread Bruto vs. Spread Liquido (Executadas) — {ativo_foco}")
             g1, g2 = st.columns(2)
             with g1:
                 st.caption("Spread Bruto (%) vs. Spread Liquido apos Custos (%)")
@@ -387,10 +386,10 @@ def renderizar_painel(
                 st.caption("Lucro Liquido Acumulado (USDT)")
                 st.line_chart(df_a[["Acumulado_USDT"]], height=230)
 
-    st.subheader("Operacoes Realizadas")
+    st.subheader("Operacoes Executadas")
     trs = []
     for r in st.session_state.linhas:
-        if r.get("Acao") != "REALIZADA":
+        if r.get("Acao") != "EXECUTADA":
             continue
         liq_val = float(r.get("Liq_USDT", 0.0))
         sinal_val = "+" if liq_val > 0 else ""
@@ -405,23 +404,26 @@ def renderizar_painel(
             f"</tr>"
         )
 
-    st.markdown(
-        "<div style='width:100%;overflow-x:auto;border-radius:8px;border:1px solid #d1d5db;'>"
-        "<table style='width:100%;border-collapse:collapse;font-size:17px;'>"
-        "<thead>"
-        "<tr style='background:#1f2937;color:#ffffff;font-size:16px;'>"
-        "<th style='padding:11px 10px;text-align:left;'>Resultado</th>"
-        "<th style='padding:11px 10px;text-align:left;'>Ativo</th>"
-        "<th style='padding:11px 10px;text-align:left;'>Corretora</th>"
-        "<th style='padding:11px 10px;text-align:left;'>Valor USDT</th>"
-        "<th style='padding:11px 10px;text-align:left;'>Status</th>"
-        "</tr>"
-        "</thead>"
-        "<tbody>" + "".join(trs) + "</tbody>"
-        "</table>"
-        "</div>",
-        unsafe_allow_html=True,
-    )
+    if trs:
+        st.markdown(
+            "<div style='width:100%;overflow-x:auto;border-radius:8px;border:1px solid #d1d5db;'>"
+            "<table style='width:100%;border-collapse:collapse;font-size:17px;'>"
+            "<thead>"
+            "<tr style='background:#1f2937;color:#ffffff;font-size:16px;'>"
+            "<th style='padding:11px 10px;text-align:left;'>Resultado</th>"
+            "<th style='padding:11px 10px;text-align:left;'>Ativo</th>"
+            "<th style='padding:11px 10px;text-align:left;'>Corretora</th>"
+            "<th style='padding:11px 10px;text-align:left;'>Valor USDT</th>"
+            "<th style='padding:11px 10px;text-align:left;'>Status</th>"
+            "</tr>"
+            "</thead>"
+            "<tbody>" + "".join(trs) + "</tbody>"
+            "</table>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.info("Rodando em tempo real — aguardando nova operacao executada...")
 
     renderizar_bloco_executor(executor, cotacao)
 
@@ -435,12 +437,11 @@ with st.sidebar:
     meta_ganho = st.number_input("Limite de Ganho Sessao (USDT)", min_value=0.50, value=15.00, step=0.50)
     perda_max = st.number_input("Limite de Perda Sessao (USDT)", min_value=0.50, value=5.00, step=0.50)
     max_ordens = st.number_input("Max Ordens na Sessao", min_value=1, value=120, step=5)
-    max_sem_op = st.number_input("Parar apos Ciclos sem Oportunidade", min_value=1, value=15, step=1)
     cotacao = st.number_input("Cotacao R$ / USDT", min_value=1.0, value=5.50, step=0.10)
     taxa_ponta = st.number_input("Taxa por Ponta (%)", min_value=0.0, value=0.10, step=0.01, format="%.3f")
     slippage = st.number_input("Slippage Total (%)", min_value=0.0, value=0.04, step=0.01, format="%.3f")
     transf = st.number_input("Taxa Transferencia (USDT)", min_value=0.0, value=0.00, step=0.25, format="%.2f")
-    gatilho = st.number_input("Gatilho Liquido Minimo (%)", min_value=0.0, value=0.02, step=0.01, format="%.2f")
+    gatilho = st.number_input("Gatilho Liquido Minimo (%)", min_value=0.0, value=0.00, step=0.01, format="%.2f")
     atualizar_lote_fim_dia = st.toggle("Atualizar Lote no Final do Dia", value=True)
     pct_lote_dia = st.slider("% do Saldo no Giro", min_value=10, max_value=100, value=50, step=5) / 100.0
     ativo_foco = st.selectbox("Ativo no Grafico", [a[0] for a in MotorDadosArbitragem.ATIVOS_PADRAO], index=0)
@@ -454,7 +455,7 @@ with st.sidebar:
         st.session_state.ciclo = 0
         st.session_state.acum_usdt = 0.0
         st.session_state.custos_usdt = 0.0
-        st.session_state.realizadas_qtd = 0
+        st.session_state.executadas_qtd = 0
         st.session_state.lote_dia_atual = lote
         st.session_state.auto_ativo = True
         st.session_state.linhas = []
@@ -463,7 +464,7 @@ with st.sidebar:
 
 motor = _obter_motor()
 executor = _obter_executor(
-    lote_max, meta_ganho, perda_max, max_ordens, max_sem_op, taxa_ponta, slippage, transf, gatilho
+    lote_max, meta_ganho, perda_max, max_ordens, taxa_ponta, slippage, transf, gatilho
 )
 
 if executor.travado_por_risco:
@@ -471,7 +472,7 @@ if executor.travado_por_risco:
     auto_rodar = False
 
 if auto_rodar:
-    st.caption(f"Automatico ativo a cada {segundos}s — para por ganho (+15), perda (-5), ordens ou falta de oportunidade.")
+    st.caption(f"Automatico ativo a cada {segundos}s — so para ao bater +15.00 USDT, -5.00 USDT ou teto de ordens.")
 
     @st.fragment(run_every=segundos)
     def painel_vivo():
