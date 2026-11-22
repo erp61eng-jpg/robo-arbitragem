@@ -7,8 +7,8 @@ import streamlit as st
 from executor import ConfigRisco, ExecutorArbitragem
 from motor_dados import ControleRateLimit, MotorDadosArbitragem
 
-st.set_page_config(page_title="Arbitragem Automatica — Limite de Ganho ou Perda", layout="wide")
-st.title("Arbitragem Automatica — Parada por Limite de Ganho ou Perda")
+st.set_page_config(page_title="Arbitragem Automatica — Limite 15 / 5 USDT", layout="wide")
+st.title("Arbitragem Automatica — Limite de Ganho 15 USDT / Perda 5 USDT")
 
 
 def _init_state():
@@ -260,7 +260,6 @@ def renderizar_painel(
     st.caption(motor.limiter.status_texto())
 
     acum_brl = st.session_state.acum_usdt * cotacao
-    custos_brl = st.session_state.custos_usdt * cotacao
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Ciclos Rodados", f"#{st.session_state.ciclo}")
@@ -330,7 +329,7 @@ with st.sidebar:
     lote = st.number_input("Saldo Base / Lote Inicial (USDT)", min_value=20.0, value=180.0, step=20.0)
     lote_max = st.number_input("Teto Lote / Giro (USDT)", min_value=15.0, value=90.0, step=5.0)
     meta_ganho = st.number_input("Limite de Ganho Sessao (USDT)", min_value=0.50, value=15.00, step=0.50)
-    perda_max = st.number_input("Limite de Perda Sessao (USDT)", min_value=0.50, value=5.40, step=0.50)
+    perda_max = st.number_input("Limite de Perda Sessao (USDT)", min_value=0.50, value=5.00, step=0.50)
     cotacao = st.number_input("Cotacao R$ / USDT", min_value=1.0, value=5.50, step=0.10)
     taxa_ponta = st.number_input("Taxa por Ponta (%)", min_value=0.0, value=0.10, step=0.01, format="%.3f")
     slippage = st.number_input("Slippage Total (%)", min_value=0.0, value=0.04, step=0.01, format="%.3f")
@@ -364,7 +363,7 @@ if executor.travado_por_risco:
     auto_rodar = False
 
 if auto_rodar:
-    st.caption(f"Automatico ativo a cada {segundos}s — para sozinho ao bater o limite de ganho ou de perda.")
+    st.caption(f"Automatico ativo a cada {segundos}s — para sozinho ao bater +15.00 USDT ou -5.00 USDT.")
 
     @st.fragment(run_every=segundos)
     def painel_vivo():
