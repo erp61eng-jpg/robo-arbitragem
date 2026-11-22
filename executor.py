@@ -1,29 +1,27 @@
 import csv
 import json
 import os
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 
 @dataclass
 class ConfigRisco:
-    # SEGURANÇA: Nunca altere dry_run para False sem testar exaustivamente
-    # e sem configurar chaves de API SEM permissão de saque.
     dry_run: bool = True
-    confirmacao_live_explicita: str = "DESATIVADO"  # Só libera real se == "LIBERAR_LIVE_COM_RISCO"
+    confirmacao_live_explicita: str = "DESATIVADO"
 
-    capital_referencia_usdt: float = 180.0   # ~R$ 1.000,00
-    lote_minimo_usdt: float = 15.0           # Mínimo operacional da corretora
-    lote_maximo_usdt: float = 90.0           # Máx 50% do capital por giro
-    perda_maxima_sessao_usdt: float = 5.40   # Stop-loss: 3% de 180 USDT (~R$ 30)
-    gatilho_spread_liq_pct: float = 0.05     # Margem líquida mínima após todos os custos
-    max_ordens_sessao: int = 30              # Limite de disparos por sessão
+    capital_referencia_usdt: float = 180.0
+    lote_minimo_usdt: float = 15.0
+    lote_maximo_usdt: float = 90.0
+    perda_maxima_sessao_usdt: float = 5.40
+    gatilho_spread_liq_pct: float = 0.05
+    max_ordens_sessao: int = 30
 
-    taxa_ponta_pct: float = 0.10             # Taxa por ponta (0,10% entrada + 0,10% saída)
-    slippage_total_pct: float = 0.05         # Slippage estimado total
-    taxa_transferencia_usdt: float = 0.00    # Custo fixo de movimentação se aplicável
+    taxa_ponta_pct: float = 0.10
+    slippage_total_pct: float = 0.05
+    taxa_transferencia_usdt: float = 0.00
 
 
 @dataclass
@@ -37,7 +35,7 @@ class ResultadoExecucao:
     custos_totais_usdt: float
     spread_liquido_pct: float
     lucro_liquido_est_usdt: float
-    decisao: str          # EXECUTADO_DRY_RUN | EXECUTADO_LIVE | BLOQUEADO
+    decisao: str
     motivo: str
 
 
@@ -48,7 +46,7 @@ class ExecutorArbitragem:
         pasta_logs: str = "logs",
         cliente_corretora=None,
     ):
-        self.cfg = config or ConfigRisco()
+        self.cfg = config if config is not None else ConfigRisco()
         self.cliente = cliente_corretora
         self.pasta_logs = Path(pasta_logs)
         self.pasta_logs.mkdir(parents=True, exist_ok=True)
@@ -97,7 +95,10 @@ class ExecutorArbitragem:
             "travado_por_risco": self.travado_por_risco,
             "motivo_trava": self.motivo_trava,
         }
-        self.arquivo_estado.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        self.arquivo_estado.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
     def resetar_sessao(self):
         self.pnl_acumulado_usdt = 0.0
@@ -107,7 +108,9 @@ class ExecutorArbitragem:
         self.motivo_trava = ""
         self._salvar_estado()
 
-    def calcular_viabilidade(self, lote_usdt: float, spread_bruto_pct: float) -> tuple[float, float, float]:
+    def calcular_viabilidade(
+        self, lote_usdt: float, spread_bruto_pct: float
+    ) -> Tuple[float, float, float]:
         custo_variavel_pct = (self.cfg.taxa_ponta_pct * 2.0) + self.cfg.slippage_total_pct
         ganho_bruto_usdt = lote_usdt * (spread_bruto_pct / 100.0)
         custos_totais_usdt = (lote_usdt * (custo_variavel_pct / 100.0)) + self.cfg.taxa_transferencia_usdt
@@ -124,15 +127,15 @@ class ExecutorArbitragem:
                 res.lucro_liquido_est_usdt, res.decisao, res.motivo
             ])
 
-    def _pode_operar_live(self) -> tuple[bool, str]:
+    def _pode_operar_live(self) -> Tuple[bool, str]:
         if self.cfg.dry_run:
-            return False, "Modo DRY_RUN ativo por padrão."
+            return False, "Modo DRY_RUN ativo por padrao."
         if self.cfg.confirmacao_live_explicita != "LIBERAR_LIVE_COM_RISCO":
-            return False, "Frase de confirmação LIVE ausente ou incorreta."
+            return False, "Frase de confirmacao LIVE ausente ou incorreta."
         if os.getenv("ROBO_ARBITRAGEM_ALLOW_LIVE", "0") != "1":
-            return False, "Variável de ambiente ROBO_ARBITRAGEM_ALLOW_LIVE!=1."
+            return False, "Variavel de ambiente ROBO_ARBITRAGEM_ALLOW_LIVE!=1."
         if self.cliente is None:
-            return False, "Cliente da corretora não injetado."
+            return False, "Cliente da corretora nao injetado."
         return True, "OK"
 
     def avaliar_e_executar(
@@ -165,27 +168,93 @@ class ExecutorArbitragem:
             self._salvar_estado()
             return res
 
-        # 1. Trava de Circuit Breaker (Stop-Loss da Sessão)
         if self.travado_por_risco:
-            return bloquear(f"CIRCUIT BREAKER ATIVO: {self.motivo_trava}")
+            return bloquear("CIRCUIT BREAKER ATIVO: " + self.motivo_trava)
 
         if self.pnl_acumulado_usdt <= -abs(self.cfg.perda_maxima_sessao_usdt):
             self.travado_por_risco = True
-            self.motivo_trava = f"Perda máxima atingida ({self.pnl_acumulado_usdt:.4f} USDT)"
+            self.motivo_trava = f"Perda maxima atingida ({self.pnl_acumulado_usdt:.4f} USDT)"
             return bloquear(self.motivo_trava)
 
-        # 2. Limite de ordens por sessão
         if self.ordens_executadas >= self.cfg.max_ordens_sessao:
-            return bloquear(f"Limite máximo de {self.cfg.max_ordens_sessao} ordens atingido na sessão.")
+            return bloquear(f"Limite maximo de {self.cfg.max_ordens_sessao} ordens atingido na sessao.")
 
-        # 3. Validação de Lote e Saldo Disponível
         if lote_usdt < self.cfg.lote_minimo_usdt:
-            return bloquear(f"Lote {lote_usdt} abaixo do mínimo ({self.cfg.lote_minimo_usdt} USDT).")
+            return bloquear(f"Lote {lote_usdt} abaixo do minimo ({self.cfg.lote_minimo_usdt} USDT).")
         if lote_usdt > self.cfg.lote_maximo_usdt:
             return bloquear(f"Lote {lote_usdt} acima do teto de risco ({self.cfg.lote_maximo_usdt} USDT).")
         if lote_usdt > saldo_disponivel_usdt:
             return bloquear(f"Saldo insuficiente ({saldo_disponivel_usdt:.2f} USDT) para lote {lote_usdt:.2f}.")
 
-        # 4. Filtro Rigoroso de Custos e Gatilho Líquido
         if lucro_liq_usdt <= 0:
-            return bloquear(f"Spread bruto ({spread_bruto_pct:.4f}%) não cobre custos (-
+            return bloquear(f"Spread bruto ({spread_bruto_pct:.4f}%) nao cobre custos (-$ {custos_usdt:.4f}).")
+        if sp_liq_pct < self.cfg.gatilho_spread_liq_pct:
+            return bloquear(
+                f"Spread liquido ({sp_liq_pct:.4f}%) abaixo do gatilho ({self.cfg.gatilho_spread_liq_pct:.4f}%)."
+            )
+
+        if self.cfg.dry_run:
+            self.pnl_acumulado_usdt = round(self.pnl_acumulado_usdt + lucro_liq_usdt, 4)
+            self.custos_acumulados_usdt = round(self.custos_acumulados_usdt + custos_usdt, 4)
+            self.ordens_executadas += 1
+            self._salvar_estado()
+
+            res = ResultadoExecucao(
+                timestamp=agora,
+                modo="DRY_RUN",
+                ativo=ativo,
+                rota=rota,
+                lote_usdt=lote_usdt,
+                spread_bruto_pct=spread_bruto_pct,
+                custos_totais_usdt=custos_usdt,
+                spread_liquido_pct=sp_liq_pct,
+                lucro_liquido_est_usdt=lucro_liq_usdt,
+                decisao="EXECUTADO_DRY_RUN",
+                motivo="Simulacao aprovada apos desconto de todos os custos.",
+            )
+            self._registrar_log(res)
+            return res
+
+        pode_live, motivo_live = self._pode_operar_live()
+        if not pode_live:
+            return bloquear("Bloqueio de seguranca LIVE: " + motivo_live)
+
+        try:
+            resposta_api = self.cliente.executar_par_arbitragem(
+                ativo=ativo,
+                rota=rota,
+                lote_usdt=lote_usdt,
+            )
+            pnl_real_usdt = float(resposta_api.get("pnl_liquido_usdt", 0.0))
+            custo_real_usdt = float(resposta_api.get("custo_real_usdt", custos_usdt))
+
+            self.pnl_acumulado_usdt = round(self.pnl_acumulado_usdt + pnl_real_usdt, 4)
+            self.custos_acumulados_usdt = round(self.custos_acumulados_usdt + custo_real_usdt, 4)
+            self.ordens_executadas += 1
+
+            if self.pnl_acumulado_usdt <= -abs(self.cfg.perda_maxima_sessao_usdt):
+                self.travado_por_risco = True
+                self.motivo_trava = f"Stop-loss atingido apos ordem real ({self.pnl_acumulado_usdt:.4f} USDT)"
+
+            self._salvar_estado()
+
+            res = ResultadoExecucao(
+                timestamp=agora,
+                modo="LIVE",
+                ativo=ativo,
+                rota=rota,
+                lote_usdt=lote_usdt,
+                spread_bruto_pct=spread_bruto_pct,
+                custos_totais_usdt=custo_real_usdt,
+                spread_liquido_pct=sp_liq_pct,
+                lucro_liquido_est_usdt=pnl_real_usdt,
+                decisao="EXECUTADO_LIVE",
+                motivo="Ordem real enviada e contabilizada.",
+            )
+            self._registrar_log(res)
+            return res
+
+        except Exception as exc:
+            self.travado_por_risco = True
+            self.motivo_trava = f"Falha na execucao real: {exc}"
+            return bloquear(self.motivo_trava)
