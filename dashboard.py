@@ -1,6 +1,7 @@
 from dataclasses import fields
 import html
 from pathlib import Path
+import time
 
 import pandas as pd
 import streamlit as st
@@ -30,6 +31,7 @@ def _init_state():
         "linhas": [],
         "hist": [],
         "stats_corretoras": _stats_padrao(),
+        "destravado_inicial": False,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -68,9 +70,12 @@ def _obter_motor() -> MotorDadosArbitragem:
     if "motor_dados" not in st.session_state:
         st.session_state.motor_dados = MotorDadosArbitragem(
             modo="observacao",
-            rate_limiter=ControleRateLimit(pausa_base=10.0, pausa_maxima=120.0),
+            rate_limiter=ControleRateLimit(pausa_base=2.0, pausa_maxima=30.0),
         )
-    return st.session_state.motor_dados
+    motor = st.session_state.motor_dados
+    if hasattr(motor, "limiter") and getattr(motor.limiter, "bloqueado_ate", 0) > time.time():
+        motor.limiter.bloqueado_ate = 0.0
+    return motor
 
 
 def _obter_executor(
@@ -111,12 +116,13 @@ def _obter_executor(
     if not hasattr(ex, "ciclos_sem_oportunidade"):
         ex.ciclos_sem_oportunidade = 0
 
-    # Se havia trava antiga apenas por falta de oportunidade, libera para continuar rodando
-    if getattr(ex, "status_meta", "") == "SEM_OPORTUNIDADE":
+    # Na primeira abertura com o novo painel, limpa travas antigas herdadas do JSON
+    if not st.session_state.get("destravado_inicial", False):
         ex.travado_por_risco = False
         ex.status_meta = "EM_ANDAMENTO"
         ex.motivo_trava = ""
         ex.ciclos_sem_oportunidade = 0
+        st.session_state.destravado_inicial = True
 
     if hasattr(ex, "_avaliar_limites_sessao"):
         ex._avaliar_limites_sessao()
@@ -471,55 +477,21 @@ if executor.travado_por_risco:
     st.session_state.auto_ativo = False
     auto_rodar = False
 
-if auto_rodar:
+renderizar_painel(
+    motor,
+    executor,
+    lote,
+    taxa_ponta,
+    slippage,
+    transf,
+    cotacao,
+    ativo_foco,
+    atualizar_lote_fim_dia,
+    pct_lote_dia,
+    executar=True,
+)
+
+if st.session_state.auto_ativo and not executor.travado_por_risco:
     st.caption(f"Automatico ativo a cada {segundos}s — so para ao bater +15.00 USDT, -5.00 USDT ou teto de ordens.")
-
-    @st.fragment(run_every=segundos)
-    def painel_vivo():
-        if executor.travado_por_risco or executor._avaliar_limites_sessao():
-            st.session_state.auto_ativo = False
-            executor._salvar_estado()
-            renderizar_painel(
-                motor,
-                executor,
-                lote,
-                taxa_ponta,
-                slippage,
-                transf,
-                cotacao,
-                ativo_foco,
-                atualizar_lote_fim_dia,
-                pct_lote_dia,
-                executar=False,
-            )
-            return
-
-        renderizar_painel(
-            motor,
-            executor,
-            lote,
-            taxa_ponta,
-            slippage,
-            transf,
-            cotacao,
-            ativo_foco,
-            atualizar_lote_fim_dia,
-            pct_lote_dia,
-            executar=True,
-        )
-
-    painel_vivo()
-else:
-    renderizar_painel(
-        motor,
-        executor,
-        lote,
-        taxa_ponta,
-        slippage,
-        transf,
-        cotacao,
-        ativo_foco,
-        atualizar_lote_fim_dia,
-        pct_lote_dia,
-        executar=False,
-    )
+    time.sleep(segundos)
+    st.rerun()
