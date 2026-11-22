@@ -7,8 +7,8 @@ import streamlit as st
 from executor import ConfigRisco, ExecutorArbitragem
 from motor_dados import ControleRateLimit, MotorDadosArbitragem
 
-st.set_page_config(page_title="Arbitragem DRY_RUN — Painel Completo", layout="wide")
-st.title("Arbitragem DRY_RUN — Simulador, Risco e Auditoria")
+st.set_page_config(page_title="Arbitragem Automatica — Limite de Ganho ou Perda", layout="wide")
+st.title("Arbitragem Automatica — Parada por Limite de Ganho ou Perda")
 
 
 def _init_state():
@@ -19,6 +19,7 @@ def _init_state():
         "simulados_qtd": 0,
         "pulados_qtd": 0,
         "lote_dia_atual": 180.0,
+        "auto_ativo": True,
         "linhas": [],
         "hist": [],
     }
@@ -38,6 +39,7 @@ def _obter_motor() -> MotorDadosArbitragem:
 
 def _obter_executor(
     lote_max: float,
+    meta_ganho: float,
     perda_max: float,
     taxa_ponta: float,
     slippage: float,
@@ -50,6 +52,7 @@ def _obter_executor(
             capital_referencia_usdt=180.0,
             lote_minimo_usdt=15.0,
             lote_maximo_usdt=lote_max,
+            meta_ganho_sessao_usdt=meta_ganho,
             perda_maxima_sessao_usdt=perda_max,
             gatilho_spread_liq_pct=gatilho,
             taxa_ponta_pct=taxa_ponta,
@@ -60,11 +63,14 @@ def _obter_executor(
 
     ex = st.session_state.executor
     ex.cfg.lote_maximo_usdt = lote_max
+    ex.cfg.meta_ganho_sessao_usdt = meta_ganho
     ex.cfg.perda_maxima_sessao_usdt = perda_max
     ex.cfg.taxa_ponta_pct = taxa_ponta
     ex.cfg.slippage_total_pct = slippage
     ex.cfg.taxa_transferencia_usdt = transf
     ex.cfg.gatilho_spread_liq_pct = gatilho
+    ex._avaliar_limites_sessao()
+    ex._salvar_estado()
     return ex
 
 
@@ -76,6 +82,11 @@ def rodar_ciclo(
     atualizar_lote_fim_dia: bool,
     pct_lote_dia: float,
 ):
+    if executor.travado_por_risco or executor._avaliar_limites_sessao():
+        st.session_state.auto_ativo = False
+        executor._salvar_estado()
+        return
+
     st.session_state.ciclo += 1
     c_num = st.session_state.ciclo
     novas = []
@@ -84,6 +95,10 @@ def rodar_ciclo(
     cotacoes = motor.coletar_ciclo(motor.ATIVOS_PADRAO)
 
     for cot in cotacoes:
+        if executor.travado_por_risco:
+            st.session_state.auto_ativo = False
+            break
+
         if cot.status != "ok":
             st.session_state.pulados_qtd += 1
             novas.append({
@@ -114,8 +129,8 @@ def rodar_ciclo(
 
         if atuou:
             st.session_state.simulados_qtd += 1
-            st.session_state.acum_usdt = round(st.session_state.acum_usdt + liq_usdt, 4)
-            st.session_state.custos_usdt = round(st.session_state.custos_usdt + custo_usdt, 4)
+            st.session_state.acum_usdt = executor.pnl_acumulado_usdt
+            st.session_state.custos_usdt = executor.custos_acumulados_usdt
         else:
             st.session_state.pulados_qtd += 1
 
@@ -145,6 +160,9 @@ def rodar_ciclo(
             "Acumulado_USDT": st.session_state.acum_usdt,
         })
 
+    if executor.travado_por_risco:
+        st.session_state.auto_ativo = False
+
     if atualizar_lote_fim_dia:
         st.session_state.lote_dia_atual = executor.calcular_lote_fechamento_dia(
             saldo_base_usdt=lote_base,
@@ -152,28 +170,29 @@ def rodar_ciclo(
         )
 
     st.session_state.hist = st.session_state.hist[-250:]
-    novas.sort(key=lambda x: x["Liq_USDT"], reverse=True)
-    st.session_state.linhas = novas
+    if novas:
+        novas.sort(key=lambda x: x["Liq_USDT"], reverse=True)
+        st.session_state.linhas = novas
 
 
 def renderizar_bloco_executor(executor: ExecutorArbitragem, cotacao: float):
     st.divider()
-    st.subheader("Controle de Risco & Auditoria")
+    st.subheader("Controle de Limites, Risco & Auditoria")
 
     col_status, col_acao = st.columns([3, 1])
     with col_status:
-        if executor.travado_por_risco:
-            st.error(
-                f"CIRCUIT BREAKER ATIVO — Novas ordens bloqueadas. Motivo: {executor.motivo_trava}"
-            )
+        if executor.status_meta == "META_GANHO_ATINGIDA":
+            st.success(f"PARADA AUTOMATICA — LIMITE DE GANHO ATINGIDO: {executor.motivo_trava}")
+        elif executor.status_meta == "STOP_LOSS_ATINGIDO":
+            st.error(f"PARADA AUTOMATICA — LIMITE DE PERDA ATINGIDO: {executor.motivo_trava}")
         else:
-            st.success(
-                f"CIRCUIT BREAKER LIBERADO — Modo: {'DRY_RUN' if executor.cfg.dry_run else 'LIVE'} | "
-                f"Limite de perda: -{executor.cfg.perda_maxima_sessao_usdt:.2f} USDT"
+            st.info(
+                f"OPERACAO AUTOMATICA ATIVA — Meta Ganho: +{executor.cfg.meta_ganho_sessao_usdt:.2f} USDT | "
+                f"Limite Perda: -{executor.cfg.perda_maxima_sessao_usdt:.2f} USDT"
             )
 
     with col_acao:
-        if st.button("Resetar Trava / Sessao", use_container_width=True):
+        if st.button("Resetar e Retomar Auto", use_container_width=True):
             executor.resetar_sessao()
             st.session_state.ciclo = 0
             st.session_state.acum_usdt = 0.0
@@ -181,13 +200,14 @@ def renderizar_bloco_executor(executor: ExecutorArbitragem, cotacao: float):
             st.session_state.simulados_qtd = 0
             st.session_state.pulados_qtd = 0
             st.session_state.lote_dia_atual = 180.0
+            st.session_state.auto_ativo = True
             st.session_state.linhas = []
             st.session_state.hist = []
             st.rerun()
 
     e1, e2, e3 = st.columns(3)
     e1.metric(
-        "PnL Acumulado (Executor)",
+        "PnL Acumulado (Sessao)",
         f"$ {executor.pnl_acumulado_usdt:.4f} USDT",
         f"R$ {executor.pnl_acumulado_usdt * cotacao:.2f}",
     )
@@ -244,8 +264,8 @@ def renderizar_painel(
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Ciclos Rodados", f"#{st.session_state.ciclo}")
-    m2.metric("Lucro Liquido Simulado", f"$ {st.session_state.acum_usdt:.4f} USDT", f"R$ {acum_brl:.2f}")
-    m3.metric("Custos Descontados", f"$ {st.session_state.custos_usdt:.4f} USDT", f"R$ {custos_brl:.2f}")
+    m2.metric("Lucro Liquido Acumulado", f"$ {st.session_state.acum_usdt:.4f} USDT", f"R$ {acum_brl:.2f}")
+    m3.metric("Meta Ganho / Perda", f"+{executor.cfg.meta_ganho_sessao_usdt:.2f} / -{executor.cfg.perda_maxima_sessao_usdt:.2f}", "USDT")
     m4.metric("Lote Dia / Teto", f"$ {st.session_state.lote_dia_atual:.2f}", f"Teto: $ {executor.cfg.lote_maximo_usdt:.2f}")
 
     total_ops = st.session_state.simulados_qtd + st.session_state.pulados_qtd
@@ -266,7 +286,7 @@ def renderizar_painel(
                 st.caption("Spread Bruto (%) vs. Spread Liquido apos Custos (%)")
                 st.line_chart(df_a[["Sp_Bruto_%", "Sp_Liq_%"]], height=230)
             with g2:
-                st.caption("Lucro Liquido Acumulado Simulado (USDT)")
+                st.caption("Lucro Liquido Acumulado (USDT)")
                 st.line_chart(df_a[["Acumulado_USDT"]], height=230)
 
     st.subheader("Radar & Execucoes do Ciclo")
@@ -306,10 +326,11 @@ def renderizar_painel(
 _init_state()
 
 with st.sidebar:
-    st.header("Custos, Risco & Controles")
+    st.header("Limites, Custos & Controles")
     lote = st.number_input("Saldo Base / Lote Inicial (USDT)", min_value=20.0, value=180.0, step=20.0)
     lote_max = st.number_input("Teto Lote / Giro (USDT)", min_value=15.0, value=90.0, step=5.0)
-    perda_max = st.number_input("Stop-Loss Sessao (USDT)", min_value=0.50, value=5.40, step=0.50)
+    meta_ganho = st.number_input("Limite de Ganho Sessao (USDT)", min_value=0.50, value=15.00, step=0.50)
+    perda_max = st.number_input("Limite de Perda Sessao (USDT)", min_value=0.50, value=5.40, step=0.50)
     cotacao = st.number_input("Cotacao R$ / USDT", min_value=1.0, value=5.50, step=0.10)
     taxa_ponta = st.number_input("Taxa por Ponta (%)", min_value=0.0, value=0.10, step=0.01, format="%.3f")
     slippage = st.number_input("Slippage Total (%)", min_value=0.0, value=0.04, step=0.01, format="%.3f")
@@ -320,8 +341,9 @@ with st.sidebar:
     ativo_foco = st.selectbox("Ativo no Grafico", [a[0] for a in MotorDadosArbitragem.ATIVOS_PADRAO], index=0)
 
     st.divider()
-    auto_rodar = st.toggle("Auto-Ciclo Leve", value=False)
-    segundos = st.slider("Intervalo (seg)", min_value=2, max_value=15, value=4)
+    auto_rodar = st.toggle("Modo Automatico Continuo", value=st.session_state.auto_ativo)
+    st.session_state.auto_ativo = auto_rodar
+    segundos = st.slider("Intervalo (seg)", min_value=2, max_value=15, value=3)
 
     if st.button("Zerar Tudo"):
         st.session_state.ciclo = 0
@@ -330,27 +352,40 @@ with st.sidebar:
         st.session_state.simulados_qtd = 0
         st.session_state.pulados_qtd = 0
         st.session_state.lote_dia_atual = lote
+        st.session_state.auto_ativo = True
         st.session_state.linhas = []
         st.session_state.hist = []
 
 motor = _obter_motor()
-executor = _obter_executor(lote_max, perda_max, taxa_ponta, slippage, transf, gatilho)
+executor = _obter_executor(lote_max, meta_ganho, perda_max, taxa_ponta, slippage, transf, gatilho)
 
-b1, b2 = st.columns([2, 2])
-with b1:
-    rodar_1 = st.button("Rodar 1 Ciclo", type="primary", disabled=auto_rodar)
-with b2:
-    rodar_10 = st.button("Simular 10 Ciclos", disabled=auto_rodar)
-
-if rodar_10 and not auto_rodar:
-    for _ in range(10):
-        rodar_ciclo(motor, executor, lote, cotacao, atualizar_lote_fim_dia, pct_lote_dia)
+if executor.travado_por_risco:
+    st.session_state.auto_ativo = False
+    auto_rodar = False
 
 if auto_rodar:
-    st.caption(f"Auto-ciclo ativo a cada {segundos}s.")
+    st.caption(f"Automatico ativo a cada {segundos}s — para sozinho ao bater o limite de ganho ou de perda.")
 
     @st.fragment(run_every=segundos)
     def painel_vivo():
+        if executor.travado_por_risco or executor._avaliar_limites_sessao():
+            st.session_state.auto_ativo = False
+            executor._salvar_estado()
+            renderizar_painel(
+                motor,
+                executor,
+                lote,
+                taxa_ponta,
+                slippage,
+                transf,
+                cotacao,
+                ativo_foco,
+                atualizar_lote_fim_dia,
+                pct_lote_dia,
+                executar=False,
+            )
+            return
+
         renderizar_painel(
             motor,
             executor,
@@ -378,5 +413,5 @@ else:
         ativo_foco,
         atualizar_lote_fim_dia,
         pct_lote_dia,
-        executar=rodar_1,
+        executar=False,
     )
