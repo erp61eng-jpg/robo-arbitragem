@@ -12,17 +12,18 @@ class ConfigRisco:
     dry_run: bool = True
     confirmacao_live_explicita: str = "DESATIVADO"
 
-    capital_referencia_usdt: float = 180.0
+    capital_referencia_usdt: float = 162.0
+    saldo_por_corretora_usdt: float = 81.0
     lote_minimo_usdt: float = 15.0
-    lote_maximo_usdt: float = 90.0
+    lote_maximo_usdt: float = 40.5
     meta_ganho_sessao_usdt: float = 15.0
     perda_maxima_sessao_usdt: float = 5.0
-    gatilho_spread_liq_pct: float = 0.05
+    gatilho_spread_liq_pct: float = 0.00
     max_ordens_sessao: int = 120
-    max_ciclos_sem_oportunidade: int = 15
+    max_ciclos_sem_oportunidade: int = 999999
 
     taxa_ponta_pct: float = 0.10
-    slippage_total_pct: float = 0.05
+    slippage_total_pct: float = 0.04
     taxa_transferencia_usdt: float = 0.00
 
 
@@ -95,6 +96,8 @@ class ExecutorArbitragem:
         payload = {
             "atualizado_em": datetime.now(timezone.utc).isoformat(),
             "dry_run": self.cfg.dry_run,
+            "capital_referencia_usdt": self.cfg.capital_referencia_usdt,
+            "saldo_por_corretora_usdt": self.cfg.saldo_por_corretora_usdt,
             "pnl_acumulado_usdt": round(self.pnl_acumulado_usdt, 4),
             "custos_acumulados_usdt": round(self.custos_acumulados_usdt, 4),
             "ordens_executadas": self.ordens_executadas,
@@ -119,9 +122,9 @@ class ExecutorArbitragem:
         self._salvar_estado()
 
     def registrar_ciclo_sem_oportunidade(self) -> bool:
-        max_sem_op = int(getattr(self.cfg, "max_ciclos_sem_oportunidade", 15))
+        max_sem_op = int(getattr(self.cfg, "max_ciclos_sem_oportunidade", 999999))
         self.ciclos_sem_oportunidade += 1
-        if max_sem_op > 0 and self.ciclos_sem_oportunidade >= max_sem_op:
+        if 0 < max_sem_op <= self.ciclos_sem_oportunidade:
             self.travado_por_risco = True
             self.status_meta = "SEM_OPORTUNIDADE"
             self.motivo_trava = f"Parada automatica apos {self.ciclos_sem_oportunidade} ciclos sem oportunidade"
@@ -157,11 +160,12 @@ class ExecutorArbitragem:
 
     def calcular_lote_fechamento_dia(
         self,
-        saldo_base_usdt: float,
+        saldo_base_usdt: float = 162.0,
         percentual_uso: float = 0.50,
     ) -> float:
         saldo_pos_dia = max(0.0, float(saldo_base_usdt) + float(self.pnl_acumulado_usdt))
-        lote_calculado = saldo_pos_dia * float(percentual_uso)
+        saldo_por_ponta = saldo_pos_dia / 2.0
+        lote_calculado = saldo_por_ponta * float(percentual_uso)
         lote_limitado = min(lote_calculado, float(self.cfg.lote_maximo_usdt))
         return round(max(float(self.cfg.lote_minimo_usdt), lote_limitado), 2)
 
@@ -205,7 +209,9 @@ class ExecutorArbitragem:
     ) -> ResultadoExecucao:
         agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         modo_atual = "DRY_RUN" if self.cfg.dry_run else "LIVE"
-        custos_usdt, sp_liq_pct, lucro_liq_usdt = self.calcular_viabilidade(lote_usdt, spread_bruto_pct)
+        teto_ponta = float(getattr(self.cfg, "saldo_por_corretora_usdt", 81.0))
+        lote_seguro = min(float(lote_usdt), teto_ponta, float(self.cfg.lote_maximo_usdt))
+        custos_usdt, sp_liq_pct, lucro_liq_usdt = self.calcular_viabilidade(lote_seguro, spread_bruto_pct)
 
         def bloquear(motivo: str) -> ResultadoExecucao:
             res = ResultadoExecucao(
@@ -213,7 +219,7 @@ class ExecutorArbitragem:
                 modo=modo_atual,
                 ativo=ativo,
                 rota=rota,
-                lote_usdt=lote_usdt,
+                lote_usdt=lote_seguro,
                 spread_bruto_pct=spread_bruto_pct,
                 custos_totais_usdt=custos_usdt,
                 spread_liquido_pct=sp_liq_pct,
@@ -228,12 +234,12 @@ class ExecutorArbitragem:
         if self._avaliar_limites_sessao() or self.travado_por_risco:
             return bloquear("PARADA AUTOMATICA: " + (self.motivo_trava or "Limite atingido"))
 
-        if lote_usdt < self.cfg.lote_minimo_usdt:
-            return bloquear(f"Lote {lote_usdt} abaixo do minimo ({self.cfg.lote_minimo_usdt} USDT).")
-        if lote_usdt > self.cfg.lote_maximo_usdt:
-            return bloquear(f"Lote {lote_usdt} acima do teto de risco ({self.cfg.lote_maximo_usdt} USDT).")
-        if lote_usdt > saldo_disponivel_usdt:
-            return bloquear(f"Saldo insuficiente ({saldo_disponivel_usdt:.2f} USDT) para lote {lote_usdt:.2f}.")
+        if lote_seguro < self.cfg.lote_minimo_usdt:
+            return bloquear(f"Lote {lote_seguro} abaixo do minimo ({self.cfg.lote_minimo_usdt} USDT).")
+        if lote_seguro > self.cfg.lote_maximo_usdt:
+            return bloquear(f"Lote {lote_seguro} acima do teto de risco ({self.cfg.lote_maximo_usdt} USDT).")
+        if lote_seguro > saldo_disponivel_usdt:
+            return bloquear(f"Saldo insuficiente ({saldo_disponivel_usdt:.2f} USDT) para lote {lote_seguro:.2f}.")
 
         if lucro_liq_usdt <= 0:
             return bloquear(f"Spread bruto ({spread_bruto_pct:.4f}%) nao cobre custos (-$ {custos_usdt:.4f}).")
@@ -255,7 +261,7 @@ class ExecutorArbitragem:
                 modo="DRY_RUN",
                 ativo=ativo,
                 rota=rota,
-                lote_usdt=lote_usdt,
+                lote_usdt=lote_seguro,
                 spread_bruto_pct=spread_bruto_pct,
                 custos_totais_usdt=custos_usdt,
                 spread_liquido_pct=sp_liq_pct,
@@ -274,7 +280,7 @@ class ExecutorArbitragem:
             resposta_api = self.cliente.executar_par_arbitragem(
                 ativo=ativo,
                 rota=rota,
-                lote_usdt=lote_usdt,
+                lote_usdt=lote_seguro,
             )
             pnl_real_usdt = float(resposta_api.get("pnl_liquido_usdt", 0.0))
             custo_real_usdt = float(resposta_api.get("custo_real_usdt", custos_usdt))
@@ -291,7 +297,7 @@ class ExecutorArbitragem:
                 modo="LIVE",
                 ativo=ativo,
                 rota=rota,
-                lote_usdt=lote_usdt,
+                lote_usdt=lote_seguro,
                 spread_bruto_pct=spread_bruto_pct,
                 custos_totais_usdt=custo_real_usdt,
                 spread_liquido_pct=sp_liq_pct,
