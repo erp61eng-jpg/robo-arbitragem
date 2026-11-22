@@ -18,7 +18,7 @@ class ConfigRisco:
     lote_maximo_usdt: float = 40.5
     meta_ganho_sessao_usdt: float = 15.0
     perda_maxima_sessao_usdt: float = 5.0
-    gatilho_spread_liq_pct: float = 0.00
+    gatilho_spread_liq_pct: float = 0.05
     max_ordens_sessao: int = 120
     max_ciclos_sem_oportunidade: int = 999999
 
@@ -98,6 +98,7 @@ class ExecutorArbitragem:
             "dry_run": self.cfg.dry_run,
             "capital_referencia_usdt": self.cfg.capital_referencia_usdt,
             "saldo_por_corretora_usdt": self.cfg.saldo_por_corretora_usdt,
+            "gatilho_spread_liq_pct": self.cfg.gatilho_spread_liq_pct,
             "pnl_acumulado_usdt": round(self.pnl_acumulado_usdt, 4),
             "custos_acumulados_usdt": round(self.custos_acumulados_usdt, 4),
             "ordens_executadas": self.ordens_executadas,
@@ -212,6 +213,7 @@ class ExecutorArbitragem:
         teto_ponta = float(getattr(self.cfg, "saldo_por_corretora_usdt", 81.0))
         lote_seguro = min(float(lote_usdt), teto_ponta, float(self.cfg.lote_maximo_usdt))
         custos_usdt, sp_liq_pct, lucro_liq_usdt = self.calcular_viabilidade(lote_seguro, spread_bruto_pct)
+        gatilho_minimo = float(getattr(self.cfg, "gatilho_spread_liq_pct", 0.05))
 
         def bloquear(motivo: str) -> ResultadoExecucao:
             res = ResultadoExecucao(
@@ -243,9 +245,9 @@ class ExecutorArbitragem:
 
         if lucro_liq_usdt <= 0:
             return bloquear(f"Spread bruto ({spread_bruto_pct:.4f}%) nao cobre custos (-$ {custos_usdt:.4f}).")
-        if sp_liq_pct < self.cfg.gatilho_spread_liq_pct:
+        if sp_liq_pct < gatilho_minimo:
             return bloquear(
-                f"Spread liquido ({sp_liq_pct:.4f}%) abaixo do gatilho ({self.cfg.gatilho_spread_liq_pct:.4f}%)."
+                f"Spread liquido ({sp_liq_pct:.4f}%) abaixo do gatilho minimo ({gatilho_minimo:.4f}%)."
             )
 
         if self.cfg.dry_run:
@@ -267,7 +269,7 @@ class ExecutorArbitragem:
                 spread_liquido_pct=sp_liq_pct,
                 lucro_liquido_est_usdt=lucro_liq_usdt,
                 decisao="EXECUTADO_DRY_RUN",
-                motivo="Simulacao aprovada apos desconto de todos os custos.",
+                motivo=f"Simulacao aprovada (spread liquido >= {gatilho_minimo:.2f}%).",
             )
             self._registrar_log(res)
             return res
