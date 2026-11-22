@@ -9,8 +9,8 @@ import streamlit as st
 from executor import ConfigRisco, ExecutorArbitragem
 from motor_dados import ControleRateLimit, MotorDadosArbitragem
 
-st.set_page_config(page_title="Arbitragem Automatica — 162 USDT (81 Binance + 81 Bybit)", layout="wide")
-st.title("Arbitragem Automatica — Capital 162 USDT (81 Binance + 81 Bybit)")
+st.set_page_config(page_title="Arbitragem Automatica — Gatilho 0.05% (162 USDT)", layout="wide")
+st.title("Arbitragem Automatica — Gatilho Liquido Minimo 0.05% (162 USDT)")
 
 
 def _stats_padrao() -> dict:
@@ -280,6 +280,7 @@ def renderizar_bloco_executor(executor: ExecutorArbitragem, cotacao: float, sald
     meta_ganho_val = float(getattr(executor.cfg, "meta_ganho_sessao_usdt", 15.0))
     perda_max_val = float(getattr(executor.cfg, "perda_maxima_sessao_usdt", 5.0))
     max_ordens_val = int(getattr(executor.cfg, "max_ordens_sessao", 120))
+    gatilho_val = float(getattr(executor.cfg, "gatilho_spread_liq_pct", 0.05))
 
     col_status, col_acao = st.columns([3, 1])
     with col_status:
@@ -291,8 +292,8 @@ def renderizar_bloco_executor(executor: ExecutorArbitragem, cotacao: float, sald
             st.warning(f"⏸️ PARADA AUTOMATICA — {executor.motivo_trava}")
         else:
             st.info(
-                f"RODANDO AUTOMATICO — Lote Giro: ${st.session_state.lote_dia_atual:.2f} USDT "
-                f"(Max/Ponta: ${saldo_corretora:.2f}) | Ganho: +${meta_ganho_val:.2f} | Perda: -${perda_max_val:.2f}"
+                f"RODANDO AUTOMATICO — Gatilho Liq.: {gatilho_val:.2f}% | "
+                f"Lote Giro: ${st.session_state.lote_dia_atual:.2f} USDT | Ganho: +${meta_ganho_val:.2f} | Perda: -${perda_max_val:.2f}"
             )
 
     with col_acao:
@@ -442,7 +443,7 @@ def renderizar_painel(
             unsafe_allow_html=True,
         )
     else:
-        st.info("Rodando em tempo real — aguardando nova operacao executada...")
+        st.info("Rodando em tempo real — aguardando operacao com spread liquido >= 0.05%...")
 
     renderizar_bloco_executor(executor, cotacao, saldo_corretora)
 
@@ -469,7 +470,7 @@ with st.sidebar:
     taxa_ponta = st.number_input("Taxa por Ponta (%)", min_value=0.0, value=0.10, step=0.01, format="%.3f")
     slippage = st.number_input("Slippage Total (%)", min_value=0.0, value=0.04, step=0.01, format="%.3f")
     transf = st.number_input("Taxa Transferencia (USDT)", min_value=0.0, value=0.00, step=0.25, format="%.2f")
-    gatilho = st.number_input("Gatilho Liquido Minimo (%)", min_value=0.0, value=0.00, step=0.01, format="%.2f")
+    gatilho = st.number_input("Gatilho Liquido Minimo (%)", min_value=0.0, value=0.05, step=0.01, format="%.2f")
     atualizar_lote_fim_dia = st.toggle("Atualizar Lote no Final do Dia", value=True)
     pct_lote_dia = st.slider("% do Saldo no Giro", min_value=10, max_value=100, value=50, step=5) / 100.0
     ativo_foco = st.selectbox("Ativo no Grafico", [a[0] for a in MotorDadosArbitragem.ATIVOS_PADRAO], index=0)
@@ -515,6 +516,6 @@ renderizar_painel(
 )
 
 if st.session_state.auto_ativo and not executor.travado_por_risco:
-    st.caption(f"Automatico ativo a cada {segundos}s — so para ao bater +15.00 USDT, -5.00 USDT ou teto de ordens.")
+    st.caption(f"Automatico ativo a cada {segundos}s — exige spread liquido >= {gatilho:.2f}% e para por +15.00, -5.00 ou teto de ordens.")
     time.sleep(segundos)
     st.rerun()
