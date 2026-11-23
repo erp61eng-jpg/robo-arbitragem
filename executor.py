@@ -19,7 +19,7 @@ class ConfigRisco:
     meta_ganho_sessao_usdt: float = 15.0
     perda_maxima_sessao_usdt: float = 5.0
     gatilho_spread_liq_pct: float = 0.05
-    max_ordens_sessao: int = 120
+    max_ordens_sessao: int = 200
     max_ciclos_sem_oportunidade: int = 999999
 
     taxa_ponta_pct: float = 0.10
@@ -96,9 +96,11 @@ class ExecutorArbitragem:
         payload = {
             "atualizado_em": datetime.now(timezone.utc).isoformat(),
             "dry_run": self.cfg.dry_run,
+            "corretoras": ["Binance", "OKX"],
             "capital_referencia_usdt": self.cfg.capital_referencia_usdt,
             "saldo_por_corretora_usdt": self.cfg.saldo_por_corretora_usdt,
             "gatilho_spread_liq_pct": self.cfg.gatilho_spread_liq_pct,
+            "max_ordens_sessao": self.cfg.max_ordens_sessao,
             "pnl_acumulado_usdt": round(self.pnl_acumulado_usdt, 4),
             "custos_acumulados_usdt": round(self.custos_acumulados_usdt, 4),
             "ordens_executadas": self.ordens_executadas,
@@ -137,7 +139,7 @@ class ExecutorArbitragem:
     def _avaliar_limites_sessao(self) -> bool:
         meta_ganho = float(getattr(self.cfg, "meta_ganho_sessao_usdt", 15.0))
         perda_max = float(getattr(self.cfg, "perda_maxima_sessao_usdt", 5.0))
-        max_ordens = int(getattr(self.cfg, "max_ordens_sessao", 120))
+        max_ordens = int(getattr(self.cfg, "max_ordens_sessao", 200))
 
         if perda_max > 0 and self.pnl_acumulado_usdt <= -abs(perda_max):
             self.travado_por_risco = True
@@ -154,7 +156,7 @@ class ExecutorArbitragem:
         if max_ordens > 0 and self.ordens_executadas >= max_ordens:
             self.travado_por_risco = True
             self.status_meta = "LIMITE_ORDENS_ATINGIDO"
-            self.motivo_trava = f"Limite de {max_ordens} ordens atingido na sessao"
+            self.motivo_trava = f"Limite de {max_ordens} transacoes atingido na rodada"
             return True
 
         return False
