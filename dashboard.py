@@ -9,14 +9,14 @@ import streamlit as st
 from executor import ConfigRisco, ExecutorArbitragem
 from motor_dados import ControleRateLimit, MotorDadosArbitragem
 
-st.set_page_config(page_title="Arbitragem Automatica — Gatilho 0.05% (162 USDT)", layout="wide")
-st.title("Arbitragem Automatica — Gatilho Liquido Minimo 0.05% (162 USDT)")
+st.set_page_config(page_title="Arbitragem Automatica — Binance + OKX (200 Transacoes)", layout="wide")
+st.title("Arbitragem Automatica — 162 USDT (81 Binance + 81 OKX) | 200 Transacoes")
 
 
 def _stats_padrao() -> dict:
     return {
         "Binance": {"saldo_base_usdt": 81.0, "lucro_usdt": 0.0, "loss_usdt": 0.0, "ops": 0},
-        "Bybit": {"saldo_base_usdt": 81.0, "lucro_usdt": 0.0, "loss_usdt": 0.0, "ops": 0},
+        "OKX": {"saldo_base_usdt": 81.0, "lucro_usdt": 0.0, "loss_usdt": 0.0, "ops": 0},
     }
 
 
@@ -37,7 +37,10 @@ def _init_state():
         if k not in st.session_state:
             st.session_state[k] = v
 
-    if not isinstance(st.session_state.get("stats_corretoras"), dict) or not st.session_state["stats_corretoras"]:
+    if (
+        not isinstance(st.session_state.get("stats_corretoras"), dict)
+        or "OKX" not in st.session_state["stats_corretoras"]
+    ):
         st.session_state["stats_corretoras"] = _stats_padrao()
 
 
@@ -47,12 +50,12 @@ def _extrair_corretora(rota: str) -> str:
         partes = [p.strip() for p in rota_limpa.split("->")]
         if "Binance" in partes[-1]:
             return "Binance"
-        if "Bybit" in partes[-1]:
-            return "Bybit"
+        if "OKX" in partes[-1]:
+            return "OKX"
     if "Binance" in rota_limpa:
         return "Binance"
-    if "Bybit" in rota_limpa:
-        return "Bybit"
+    if "OKX" in rota_limpa:
+        return "OKX"
     return "Binance"
 
 
@@ -243,9 +246,9 @@ def rodar_ciclo(
 
 
 def renderizar_bloco_corretoras(cotacao: float, saldo_corretora: float):
-    st.subheader("🟢 Lucro e 🔴 Loss por Corretora (Base 81.0 USDT Cada)")
+    st.subheader("🟢 Lucro e 🔴 Loss por Corretora (Binance + OKX — Base 81.0 USDT Cada)")
     stats = st.session_state.get("stats_corretoras") or _stats_padrao()
-    nomes = list(stats.keys()) or ["Binance", "Bybit"]
+    nomes = list(stats.keys()) or ["Binance", "OKX"]
     cols = st.columns(len(nomes))
 
     for idx, nome_cor in enumerate(nomes):
@@ -279,7 +282,7 @@ def renderizar_bloco_executor(executor: ExecutorArbitragem, cotacao: float, sald
     status_meta = getattr(executor, "status_meta", "EM_ANDAMENTO")
     meta_ganho_val = float(getattr(executor.cfg, "meta_ganho_sessao_usdt", 15.0))
     perda_max_val = float(getattr(executor.cfg, "perda_maxima_sessao_usdt", 5.0))
-    max_ordens_val = int(getattr(executor.cfg, "max_ordens_sessao", 120))
+    max_ordens_val = int(getattr(executor.cfg, "max_ordens_sessao", 200))
     gatilho_val = float(getattr(executor.cfg, "gatilho_spread_liq_pct", 0.05))
 
     col_status, col_acao = st.columns([3, 1])
@@ -292,8 +295,8 @@ def renderizar_bloco_executor(executor: ExecutorArbitragem, cotacao: float, sald
             st.warning(f"⏸️ PARADA AUTOMATICA — {executor.motivo_trava}")
         else:
             st.info(
-                f"RODANDO AUTOMATICO — Gatilho Liq.: {gatilho_val:.2f}% | "
-                f"Lote Giro: ${st.session_state.lote_dia_atual:.2f} USDT | Ganho: +${meta_ganho_val:.2f} | Perda: -${perda_max_val:.2f}"
+                f"RODANDO AUTOMATICO (Binance + OKX) — Gatilho Liq.: {gatilho_val:.2f}% | "
+                f"Lote: ${st.session_state.lote_dia_atual:.2f} | Limite: {executor.ordens_executadas}/{max_ordens_val} transacoes"
             )
 
     with col_acao:
@@ -323,7 +326,7 @@ def renderizar_bloco_executor(executor: ExecutorArbitragem, cotacao: float, sald
         f"R$ {executor.custos_acumulados_usdt * cotacao:.2f}",
     )
     e3.metric(
-        "Ordens Executadas",
+        "Transacoes na Rodada",
         f"{executor.ordens_executadas}/{max_ordens_val}",
     )
 
@@ -382,7 +385,7 @@ def renderizar_painel(
     sinal_acum = "🟢 +" if acum_usdt >= 0 else "🔴 "
 
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Operacoes Executadas", f"{st.session_state.executadas_qtd}")
+    m1.metric("Transacoes Executadas", f"{st.session_state.executadas_qtd}/200")
     m2.metric("🟢 Lucro Executado", f"+$ {total_lucro_cor:.4f} USDT", f"R$ {total_lucro_cor * cotacao:.2f}")
     m3.metric("🔴 Loss Executado", f"-$ {total_loss_cor:.4f} USDT", f"-R$ {total_loss_cor * cotacao:.2f}")
     m4.metric(
@@ -443,7 +446,7 @@ def renderizar_painel(
             unsafe_allow_html=True,
         )
     else:
-        st.info("Rodando em tempo real — aguardando operacao com spread liquido >= 0.05%...")
+        st.info("Rodando em tempo real (Binance + OKX) — aguardando operacao com spread liquido >= 0.05%...")
 
     renderizar_bloco_executor(executor, cotacao, saldo_corretora)
 
@@ -454,7 +457,7 @@ with st.sidebar:
     st.header("Limites, Custos & Controles")
     saldo_corretora = st.number_input("Saldo por Corretora (USDT)", min_value=15.0, value=81.0, step=1.0)
     capital_total = round(saldo_corretora * 2.0, 2)
-    st.caption(f"Capital Total Calculado: **${capital_total:.2f} USDT** (${saldo_corretora:.2f} Binance + ${saldo_corretora:.2f} Bybit)")
+    st.caption(f"Capital Total Calculado: **${capital_total:.2f} USDT** (${saldo_corretora:.2f} Binance + ${saldo_corretora:.2f} OKX)")
 
     lote_max = st.number_input(
         "Teto Lote / Giro (USDT)",
@@ -465,7 +468,7 @@ with st.sidebar:
     )
     meta_ganho = st.number_input("Limite de Ganho Sessao (USDT)", min_value=0.50, value=15.00, step=0.50)
     perda_max = st.number_input("Limite de Perda Sessao (USDT)", min_value=0.50, value=5.00, step=0.50)
-    max_ordens = st.number_input("Max Ordens na Sessao", min_value=1, value=120, step=5)
+    max_ordens = st.number_input("Transacoes por Rodada", min_value=1, value=200, step=10)
     cotacao = st.number_input("Cotacao R$ / USDT", min_value=1.0, value=5.50, step=0.10)
     taxa_ponta = st.number_input("Taxa por Ponta (%)", min_value=0.0, value=0.10, step=0.01, format="%.3f")
     slippage = st.number_input("Slippage Total (%)", min_value=0.0, value=0.04, step=0.01, format="%.3f")
@@ -516,6 +519,6 @@ renderizar_painel(
 )
 
 if st.session_state.auto_ativo and not executor.travado_por_risco:
-    st.caption(f"Automatico ativo a cada {segundos}s — exige spread liquido >= {gatilho:.2f}% e para por +15.00, -5.00 ou teto de ordens.")
+    st.caption(f"Automatico ativo (Binance + OKX) a cada {segundos}s — limite de {max_ordens} transacoes, +15.00 ou -5.00 USDT.")
     time.sleep(segundos)
     st.rerun()
