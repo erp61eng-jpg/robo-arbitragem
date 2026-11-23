@@ -1,103 +1,107 @@
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
-
-try:
-    import ccxt
-except Exception:
-    ccxt = None
+import ccxt
 
 
-def carregar_env_local(caminho: str = ".env"):
-    arquivo = Path(caminho)
-    if not arquivo.exists():
+def carregar_env_local():
+    """Carrega variáveis do arquivo .env na pasta do projeto se existir."""
+    env_path = Path(__file__).resolve().parent / ".env"
+    if not env_path.exists():
         return
-    for linha in arquivo.read_text(encoding="utf-8").splitlines():
-        linha = linha.strip()
-        if not linha or linha.startswith("#") or "=" not in linha:
-            continue
-        chave, valor = linha.split("=", 1)
-        chave = chave.strip()
-        valor = valor.strip().strip('"').strip("'")
-        if chave and chave not in os.environ:
-            os.environ[chave] = valor
+    try:
+        for linha in env_path.read_text(encoding="utf-8").splitlines():
+            linha_limpa = linha.strip()
+            if not linha_limpa or linha_limpa.startswith("#") or "=" not in linha_limpa:
+                continue
+            chave, valor = linha_limpa.split("=", 1)
+            chave = chave.strip()
+            valor = valor.strip().strip('"').strip("'")
+            if chave and chave not in os.environ:
+                os.environ[chave] = valor
+    except Exception:
+        pass
 
 
-class ClienteBinanceOKX:
-    def __init__(
-        self,
-        binance_api_key: Optional[str] = None,
-        binance_api_secret: Optional[str] = None,
-        okx_api_key: Optional[str] = None,
-        okx_api_secret: Optional[str] = None,
-        okx_passphrase: Optional[str] = None,
-    ):
-        carregar_env_local()
+def _obter_segredo(nome: str) -> str:
+    carregar_env_local()
+    val = os.getenv(nome, "")
+    if val:
+        return str(val).strip()
+    try:
+        import streamlit as st
+        if hasattr(st, "secrets") and nome in st.secrets:
+            return str(st.secrets[nome]).strip()
+    except Exception:
+        pass
+    return ""
 
-        self.b_key = (binance_api_key or os.getenv("BINANCE_API_KEY", "")).strip()
-        self.b_secret = (binance_api_secret or os.getenv("BINANCE_API_SECRET", "")).strip()
 
-        self.o_key = (okx_api_key or os.getenv("OKX_API_KEY", "")).strip()
-        self.o_secret = (okx_api_secret or os.getenv("OKX_API_SECRET", "")).strip()
-        self.o_passphrase = (okx_passphrase or os.getenv("OKX_API_PASSPHRASE", "")).strip()
+def obter_saldos_reais() -> dict:
+    """Consulta o saldo em USDT na Binance e na OKX e retorna um dicionário."""
+    carregar_env_local()
 
-        self.binance = None
-        self.okx = None
+    binance_key = _obter_segredo("BINANCE_API_KEY")
+    binance_secret = _obter_segredo("BINANCE_API_SECRET")
 
-        if ccxt is not None:
-            if self.b_key and self.b_secret:
-                self.binance = ccxt.binance({
-                    "apiKey": self.b_key,
-                    "secret": self.b_secret,
+    okx_key = _obter_segredo("OKX_API_KEY")
+    okx_secret = _obter_segredo("OKX_API_SECRET")
+    okx_passphrase = _obter_segredo("OKX_API_PASSPHRASE")
+
+    resultado = {
+        "Binance": 0.0,
+        "OKX": 0.0,
+        "erro_binance": "",
+        "erro_okx": "",
+    }
+
+    if binance_key and binance_secret:
+        try:
+            exchange_b = ccxt.binance(
+                {
+                    "apiKey": binance_key,
+                    "secret": binance_secret,
                     "enableRateLimit": True,
-                    "options": {"defaultType": "spot"},
-                })
-            if self.o_key and self.o_secret and self.o_passphrase:
-                self.okx = ccxt.okx({
-                    "apiKey": self.o_key,
-                    "secret": self.o_secret,
-                    "password": self.o_passphrase,
+                }
+            )
+            bal_b = exchange_b.fetch_balance()
+            usdt_b = bal_b.get("USDT") or {}
+            livre_b = usdt_b.get("free")
+            total_b = usdt_b.get("total")
+            if livre_b is not None:
+                resultado["Binance"] = float(livre_b)
+            elif total_b is not None:
+                resultado["Binance"] = float(total_b)
+        except Exception as exc:
+            resultado["erro_binance"] = str(exc)
+    else:
+        resultado["erro_binance"] = "Chaves da Binance não configuradas."
+
+    if okx_key and okx_secret and okx_passphrase:
+        try:
+            exchange_o = ccxt.okx(
+                {
+                    "apiKey": okx_key,
+                    "secret": okx_secret,
+                    "password": okx_passphrase,
                     "enableRateLimit": True,
-                    "options": {"defaultType": "spot"},
-                })
+                }
+            )
+            bal_o = exchange_o.fetch_balance()
+            usdt_o = bal_o.get("USDT") or {}
+            livre_o = usdt_o.get("free")
+            total_o = usdt_o.get("total")
+            if livre_o is not None:
+                resultado["OKX"] = float(livre_o)
+            elif total_o is not None:
+                resultado["OKX"] = float(total_o)
+        except Exception as exc:
+            resultado["erro_okx"] = str(exc)
+    else:
+        resultado["erro_okx"] = "Chaves ou passphrase da OKX não configuradas."
 
-    def status_conexoes(self) -> Dict[str, bool]:
-        return {
-            "binance_configurada": self.binance is not None,
-            "okx_configurada": self.okx is not None,
-        }
-
-    def consultar_saldo_usdt(self) -> Dict[str, Any]:
-        resultado: Dict[str, Any] = {
-            "Binance": 0.0,
-            "OKX": 0.0,
-            "erro_binance": "",
-            "erro_okx": "",
-        }
-
-        if self.binance is not None:
-            try:
-                bal_b = self.binance.fetch_balance()
-                resultado["Binance"] = float((bal_b.get("USDT") or {}).get("free", 0.0) or 0.0)
-            except Exception as exc:
-                resultado["erro_binance"] = str(exc)
-
-        if self.okx is not None:
-            try:
-                bal_o = self.okx.fetch_balance()
-                resultado["OKX"] = float((bal_o.get("USDT") or {}).get("free", 0.0) or 0.0)
-            except Exception as exc:
-                resultado["erro_okx"] = str(exc)
-
-        return resultado
-
-    def executar_par_arbitragem(self, ativo: str, rota: str, lote_usdt: float) -> Dict[str, Any]:
-        raise RuntimeError(
-            "Execucao real bloqueada neste cliente inicial: valide leitura de saldo e precos com DRY_RUN=True antes de habilitar envio de ordens."
-        )
+    return resultado
 
 
 if __name__ == "__main__":
-    cli = ClienteBinanceOKX()
-    print("Conexoes:", cli.status_conexoes())
-    print("Saldos USDT:", cli.consultar_saldo_usdt())
+    saldos = obter_saldos_reais()
+    print("Saldos USDT:", saldos)
