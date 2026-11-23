@@ -65,112 +65,16 @@ if "lucro_sim" not in st.session_state:
     st.session_state.lucro_sim = 0.0
 if "historico_sim" not in st.session_state:
     st.session_state.historico_sim = []
-
-# ==========================================================
-# FUNÇÕES SEGURAS PARA LER CORRETORA_CLIENTE SEM IMPORTBREAK
-# ==========================================================
-def _extrair_numero(valor, padrao=0.0):
-    try:
-        if valor is None:
-            return padrao
-        return float(valor)
-    except (TypeError, ValueError):
-        return padrao
+if "saldos_reais_cache" not in st.session_state:
+    st.session_state.saldos_reais_cache = None
 
 
-def ler_saldos_reais():
-    """Tenta ler saldos de várias funções possíveis em corretora_cliente.py."""
-    nomes_possiveis = (
-        "consultar_saldos_usdt",
-        "obter_saldos_usdt",
-        "buscar_saldos_usdt",
-        "ler_saldos_usdt",
-        "consultar_saldos",
-        "obter_saldos",
-        "buscar_saldos",
-        "get_saldos",
-    )
-
-    resultado = None
-    for nome in nomes_possiveis:
-        func = getattr(corretora_cliente, nome, None)
-        if callable(func):
-            try:
-                resultado = func()
-                break
-            except Exception as exc:
-                return {
-                    "Binance": 0.0,
-                    "OKX": 0.0,
-                    "erro_binance": str(exc),
-                    "erro_okx": str(exc),
-                }
-
-    if isinstance(resultado, dict):
-        binance = _extrair_numero(
-            resultado.get("Binance", resultado.get("binance", resultado.get("BINANCE", 0.0))),
-            0.0,
-        )
-        okx = _extrair_numero(
-            resultado.get("OKX", resultado.get("okx", resultado.get("Okx", 0.0))),
-            0.0,
-        )
-        erro_binance = str(resultado.get("erro_binance", "") or "")
-        erro_okx = str(resultado.get("erro_okx", "") or "")
-        return {
-            "Binance": binance,
-            "OKX": okx,
-            "erro_binance": erro_binance,
-            "erro_okx": erro_okx,
-        }
-
-    # Caso o corretora_cliente tenha funções separadas por corretora
-    binance_val = 0.0
-    okx_val = 0.0
-    erro_b = ""
-    erro_o = ""
-
-    for nome_b in ("saldo_binance", "obter_saldo_binance", "consultar_binance"):
-        fb = getattr(corretora_cliente, nome_b, None)
-        if callable(fb):
-            try:
-                binance_val = _extrair_numero(fb(), 0.0)
-            except Exception as exc:
-                erro_b = str(exc)
-            break
-
-    for nome_o in ("saldo_okx", "obter_saldo_okx", "consultar_okx"):
-        fo = getattr(corretora_cliente, nome_o, None)
-        if callable(fo):
-            try:
-                okx_val = _extrair_numero(fo(), 0.0)
-            except Exception as exc:
-                erro_o = str(exc)
-            break
-
-    return {
-        "Binance": binance_val,
-        "OKX": okx_val,
-        "erro_binance": erro_b,
-        "erro_okx": erro_o,
-    }
+def atualizar_saldos_reais_agora():
+    st.session_state.saldos_reais_cache = corretora_cliente.obter_saldos_reais()
 
 
-def verificar_status_conexoes(saldos_dict):
-    for nome in ("verificar_conexoes", "status_conexoes", "checar_conexoes"):
-        func = getattr(corretora_cliente, nome, None)
-        if callable(func):
-            try:
-                res = func()
-                if isinstance(res, dict):
-                    return res
-            except Exception:
-                pass
-    return {
-        "binance_ok": not bool(saldos_dict.get("erro_binance")),
-        "okx_ok": not bool(saldos_dict.get("erro_okx")),
-    }
-
+if st.session_state.saldos_reais_cache is None:
+    atualizar_saldos_reais_agora()
 
 # ==========================================================
 # CABEÇALHO E BOTÃO / SELETOR DE MODO (SIMULADO vs. REAL)
@@ -221,14 +125,18 @@ col_real, col_sim = st.columns(2)
 with col_real:
     st.subheader("💰 REAL (Saldos Diretos nas Corretoras)")
     if st.button("🔄 Atualizar Saldos Reais", key="btn_atualizar_saldos_reais"):
-        st.cache_data.clear()
+        atualizar_saldos_reais_agora()
         st.rerun()
 
-    saldos_reais = ler_saldos_reais()
-    status_conn = verificar_status_conexoes(saldos_reais)
+    saldos_reais = st.session_state.saldos_reais_cache or {
+        "Binance": 0.0,
+        "OKX": 0.0,
+        "erro_binance": "",
+        "erro_okx": "",
+    }
 
-    saldo_binance = saldos_reais["Binance"]
-    saldo_okx = saldos_reais["OKX"]
+    saldo_binance = float(saldos_reais.get("Binance", 0.0))
+    saldo_okx = float(saldos_reais.get("OKX", 0.0))
     saldo_total_real = saldo_binance + saldo_okx
     variacao_real = saldo_total_real - CAPITAL_TOTAL_BASE
 
@@ -249,11 +157,13 @@ with col_real:
         unsafe_allow_html=True,
     )
 
-    st.write(f"Conexões — Binance: `{status_conn.get('binance_ok', True)}` | OKX: `{status_conn.get('okx_ok', True)}`")
+    binance_ok = not bool(saldos_reais.get("erro_binance"))
+    okx_ok = not bool(saldos_reais.get("erro_okx"))
+    st.write(f"Conexões — Binance: `{binance_ok}` | OKX: `{okx_ok}`")
 
-    if saldos_reais["erro_binance"]:
+    if saldos_reais.get("erro_binance"):
         st.error(f"Binance: {saldos_reais['erro_binance']}")
-    if saldos_reais["erro_okx"]:
+    if saldos_reais.get("erro_okx"):
         st.error(f"OKX: {saldos_reais['erro_okx']}")
 
 with col_sim:
