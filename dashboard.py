@@ -86,6 +86,37 @@ META_USDT = 30.0
 STOP_USDT = -10.0
 INTERVALO_SCAN_SEG = 4.0
 
+TAXA_COMPRA_PCT = 0.10
+TAXA_VENDA_PCT = 0.10
+FOLGA_SLIPPAGE_PCT = 0.02
+
+
+def calcular_lucro_liquido_real(
+    lote_usdt: float,
+    spread_bruto_pct: float = 0.0,
+    preco_compra_vwap: float = 0.0,
+    preco_venda_vwap: float = 0.0,
+    taxa_compra_pct: float = TAXA_COMPRA_PCT,
+    taxa_venda_pct: float = TAXA_VENDA_PCT,
+    folga_slippage_pct: float = FOLGA_SLIPPAGE_PCT,
+) -> dict:
+    if preco_compra_vwap > 0 and preco_venda_vwap > 0:
+        spread_bruto = ((preco_venda_vwap - preco_compra_vwap) / preco_compra_vwap) * 100.0
+    else:
+        spread_bruto = float(spread_bruto_pct)
+
+    custos_pct = float(taxa_compra_pct) + float(taxa_venda_pct) + float(folga_slippage_pct)
+    spread_liq_pct = spread_bruto - custos_pct
+    lucro_liq_usdt = float(lote_usdt) * (spread_liq_pct / 100.0)
+
+    return {
+        "viavel": spread_liq_pct > 0 and lucro_liq_usdt > 0,
+        "spread_bruto_pct": round(spread_bruto, 4),
+        "custos_pct": round(custos_pct, 4),
+        "spread_liq_pct": round(spread_liq_pct, 4),
+        "lucro_liq_usdt": round(lucro_liq_usdt, 6),
+    }
+
 
 def _get_cliente(metodo: str):
     if corretora_cliente is None:
@@ -134,12 +165,13 @@ def corrigir_saldo_real_final() -> dict:
         return {"Binance": 0.0, "OKX": 0.0, "erro": f"{type(e).__name__}: {e}"}
 
 
-async def _coletar_motor_async(par_alvo: str, rota_alvo: str, margem_min_pct: float) -> dict:
+async def _coletar_motor_async(par_alvo: str, rota_alvo: str, lote_usdt: float, margem_min_pct: float) -> dict:
     if MotorArbitragem is None:
         return {
             "ok": False,
             "total_rotas": 0,
             "melhor_rota": rota_alvo,
+            "spread_bruto_pct": 0.0,
             "spread_liq_pct": 0.0,
             "lucro_est_usdt": 0.0,
             "motivo": "motor_arbitragem.py não encontrado; usando modo base.",
@@ -157,6 +189,7 @@ async def _coletar_motor_async(par_alvo: str, rota_alvo: str, margem_min_pct: fl
             "ok": False,
             "total_rotas": 0,
             "melhor_rota": rota_alvo,
+            "spread_bruto_pct": 0.0,
             "spread_liq_pct": 0.0,
             "lucro_est_usdt": 0.0,
             "motivo": "Nenhuma rota retornada pelo motor.",
@@ -170,37 +203,61 @@ async def _coletar_motor_async(par_alvo: str, rota_alvo: str, margem_min_pct: fl
     pool = filtradas_rota if filtradas_rota else candidatas
 
     melhor = max(pool, key=lambda x: float(x.get("Spread_Liquido_%", -999.0)))
-    spread_liq = float(melhor.get("Spread_Liquido_%", 0.0))
-    lucro_est = float(melhor.get("Lucro_Est_USDT", 0.0))
+    vwap_compra = float(melhor.get("VWAP_Compra", 0.0) or 0.0)
+    vwap_venda = float(melhor.get("VWAP_Venda", 0.0) or 0.0)
+    spread_bruto_raw = float(melhor.get("Spread_Bruto_%", melhor.get("Spread_Liquido_%", 0.0)) or 0.0)
+
+    if vwap_compra > 0 and vwap_venda > 0:
+        calc = calcular_lucro_liquido_real(
+            lote_usdt=lote_usdt,
+            preco_compra_vwap=vwap_compra,
+            preco_venda_vwap=vwap_venda,
+        )
+        spread_liq = calc["spread_liq_pct"]
+        lucro_est = calc["lucro_liq_usdt"]
+        spread_bruto = calc["spread_bruto_pct"]
+    else:
+        spread_liq = float(melhor.get("Spread_Liquido_%", 0.0) or 0.0)
+        lucro_est = round(float(lote_usdt) * (spread_liq / 100.0), 6)
+        spread_bruto = spread_bruto_raw
+
+    aprovado = spread_liq >= margem_min_pct and lucro_est > 0
 
     return {
-        "ok": spread_liq >= margem_min_pct,
+        "ok": aprovado,
         "total_rotas": len(ops),
         "melhor_rota": str(melhor.get("Rota", rota_alvo)),
+        "spread_bruto_pct": spread_bruto,
         "spread_liq_pct": spread_liq,
         "lucro_est_usdt": lucro_est,
         "motivo": (
-            f"Spread líquido {spread_liq:+.4f}% (mín. {margem_min_pct:.2f}%)"
-            if spread_liq >= margem_min_pct
-            else f"Spread líquido {spread_liq:+.4f}% abaixo de {margem_min_pct:.2f}%"
+            f"Aprovado automático: spread líq. {spread_liq:+.4f}% | lucro est. +${lucro_est:.4f} USDT"
+            if aprovado
+            else f"Bloqueado automático: spread líq. {spread_liq:+.4f}% (mín. {margem_min_pct:.2f}%)"
         ),
     }
 
 
-def consultar_motor(par: str, rota: str, margem_min_pct: float) -> dict:
+def consultar_motor(par: str, rota: str, lote_usdt: float, margem_min_pct: float) -> dict:
     agora = time.monotonic()
     cache = st.session_state.get("ultimo_scan_motor")
     if cache and (agora - cache.get("ts", 0.0)) < INTERVALO_SCAN_SEG:
-        if cache.get("par") == par and cache.get("rota") == rota and cache.get("margem") == margem_min_pct:
+        if (
+            cache.get("par") == par
+            and cache.get("rota") == rota
+            and cache.get("lote") == lote_usdt
+            and cache.get("margem") == margem_min_pct
+        ):
             return cache["dados"]
 
     try:
-        dados = asyncio.run(_coletar_motor_async(par, rota, margem_min_pct))
+        dados = asyncio.run(_coletar_motor_async(par, rota, lote_usdt, margem_min_pct))
     except Exception as e:
         dados = {
             "ok": False,
             "total_rotas": 0,
             "melhor_rota": rota,
+            "spread_bruto_pct": 0.0,
             "spread_liq_pct": 0.0,
             "lucro_est_usdt": 0.0,
             "motivo": f"Falha na leitura do motor: {type(e).__name__}: {e}",
@@ -210,6 +267,7 @@ def consultar_motor(par: str, rota: str, margem_min_pct: float) -> dict:
         "ts": time.monotonic(),
         "par": par,
         "rota": rota,
+        "lote": lote_usdt,
         "margem": margem_min_pct,
         "dados": dados,
     }
@@ -219,12 +277,11 @@ def consultar_motor(par: str, rota: str, margem_min_pct: float) -> dict:
 def rodar_op(par: str, rota: str, lote: float, real_ok: bool, scan: dict, simular_sem_spread: bool) -> dict:
     hora = time.strftime("%H:%M:%S")
     spread_liq = float(scan.get("spread_liq_pct", 0.0))
-    lucro_real_est = round(float(lote) * (spread_liq / 100.0), 4)
+    lucro_real_est = round(float(scan.get("lucro_est_usdt", 0.0)), 4)
     lucro_sim = 0.08 if float(lote) == LOTE_MAX else round(float(lote) * 0.002, 4)
 
     if not real_ok:
-        if scan.get("ok"):
-            lucro_final = lucro_real_est if lucro_real_est > 0 else lucro_sim
+        if scan.get("ok") and lucro_real_est > 0:
             return {
                 "ok": True,
                 "modo": "SIMULADO",
@@ -232,8 +289,8 @@ def rodar_op(par: str, rota: str, lote: float, real_ok: bool, scan: dict, simula
                 "par": par,
                 "rota": scan.get("melhor_rota", rota),
                 "lote": float(lote),
-                "lucro": lucro_final,
-                "msg": f"AUTO SIMULADO (APROVADO) — {par} ({spread_liq:+.4f}%) | +${lucro_final:.4f} USDT",
+                "lucro": lucro_real_est,
+                "msg": f"AUTO SIMULADO (LÍQUIDO OK) — {par} ({spread_liq:+.4f}%) | +${lucro_real_est:.4f} USDT",
             }
         if simular_sem_spread:
             return {
@@ -254,10 +311,10 @@ def rodar_op(par: str, rota: str, lote: float, real_ok: bool, scan: dict, simula
             "rota": rota,
             "lote": float(lote),
             "lucro": 0.0,
-            "msg": f"Aguardando spread >= {GATILHO_PCT:.2f}% ({scan.get('motivo', '')})",
+            "msg": scan.get("motivo", f"Aguardando spread >= {GATILHO_PCT:.2f}%"),
         }
 
-    if not scan.get("ok"):
+    if not scan.get("ok") or lucro_real_est <= 0:
         return {
             "ok": False,
             "modo": "REAL",
@@ -266,7 +323,7 @@ def rodar_op(par: str, rota: str, lote: float, real_ok: bool, scan: dict, simula
             "rota": rota,
             "lote": float(lote),
             "lucro": 0.0,
-            "msg": f"Bloqueado no REAL: {scan.get('motivo', 'spread insuficiente')}",
+            "msg": f"Bloqueado automático no REAL: {scan.get('motivo', 'spread líquido insuficiente')}",
         }
 
     cli = _get_cliente("executar_par_arbitragem")
@@ -304,7 +361,7 @@ def rodar_op(par: str, rota: str, lote: float, real_ok: bool, scan: dict, simula
             "rota": rota,
             "lote": float(lote),
             "lucro": lucro_real_est,
-            "msg": f"AUTO REAL — {par} ({rota}) | {spread_liq:+.4f}%",
+            "msg": f"AUTO REAL EXECUTADO — {par} ({rota}) | +${lucro_real_est:.4f} USDT",
         }
     except Exception as e:
         return {
@@ -327,7 +384,7 @@ def executar_passo(par: str, rota: str, lote: float, real_ok: bool, simular_sem_
     ):
         return False, "Limite de entradas, meta ou stop atingido."
 
-    scan = consultar_motor(par, rota, GATILHO_PCT)
+    scan = consultar_motor(par, rota, float(lote), GATILHO_PCT)
     r = rodar_op(par, rota, float(lote), real_ok, scan, simular_sem_spread)
     if r["ok"]:
         st.session_state.entradas += 1
@@ -367,11 +424,11 @@ if "rodando_auto" not in st.session_state:
 if "ultimo_scan_motor" not in st.session_state:
     st.session_state.ultimo_scan_motor = None
 
-st.title("🟢 Robô de Arbitragem Automático — Binance & OKX")
+st.title("🟢 Robô de Arbitragem 100% Automático — Binance & OKX")
 st.caption(
     f"Base: ${BASE_TOTAL:.1f} USDT | Lote máx.: ${LOTE_MAX:.1f} USDT | "
-    f"Gatilho: {GATILHO_PCT:.2f}% | Intervalo: {INTERVALO_SCAN_SEG:.1f}s | "
-    f"Meta: +{META_USDT:.1f} / Stop: {STOP_USDT:.1f} USDT"
+    f"Gatilho Líquido: {GATILHO_PCT:.2f}% (Taxas {TAXA_COMPRA_PCT + TAXA_VENDA_PCT:.2f}% + Folga {FOLGA_SLIPPAGE_PCT:.2f}%) | "
+    f"Ciclo: {INTERVALO_SCAN_SEG:.1f}s | Meta: +{META_USDT:.1f} / Stop: {STOP_USDT:.1f} USDT"
 )
 
 modo = st.radio(
@@ -383,20 +440,20 @@ modo = st.radio(
 simular_sem_spread = False
 real_liberado = False
 if modo.startswith("💰"):
-    real_liberado = st.checkbox("⚠️ Confirmo operar em MODO REAL na Binance e na OKX", value=False)
+    real_liberado = st.checkbox("⚠️ Confirmo operar em MODO REAL automático na Binance e na OKX", value=False)
     os.environ["ROBO_ARBITRAGEM_ALLOW_LIVE"] = "1" if real_liberado else "0"
     if real_liberado:
-        st.success("🟢 MODO REAL LIBERADO")
+        st.success("🟢 MODO REAL AUTOMÁTICO LIBERADO — Só executa quando spread líquido >= gatilho")
     else:
         st.session_state.rodando_auto = False
-        st.warning("🟡 Marque a caixa para liberar o MODO REAL")
+        st.warning("🟡 Marque a caixa para liberar o MODO REAL automático")
 else:
     os.environ["ROBO_ARBITRAGEM_ALLOW_LIVE"] = "0"
     simular_sem_spread = st.checkbox(
         "🧪 Simular passos mesmo quando o spread líquido estiver abaixo do gatilho",
         value=True,
     )
-    st.info("🔵 MODO SIMULADO (DRY_RUN) COM MOTOR VWAP ATIVO")
+    st.info("🔵 MODO SIMULADO AUTOMÁTICO ATIVO — Varredura VWAP + Taxas a cada 4s")
 
 soma_total = BASE_TOTAL + st.session_state.lucro
 st.markdown(
@@ -446,11 +503,11 @@ with c2:
     st.markdown(
         f"""
         <div class="card-verde">
-            <p class="rotulo-verde">CONTAGEM DAS OPERAÇÕES E MOTOR VWAP</p>
+            <p class="rotulo-verde">CONTAGEM DAS OPERAÇÕES E SPREAD LÍQUIDO</p>
             <div class="numero-grande">{st.session_state.contagem_ops} OPS</div>
             <p class="linha-grande">
                 Lucro: <span class="verde-destaque">{st.session_state.lucro:+.4f} USDT</span> |
-                Spread Liq.: <span class="verde-destaque">{sp_atual:+.4f}%</span>
+                Spread Líq.: <span class="verde-destaque">{sp_atual:+.4f}%</span>
             </p>
         </div>
         """,
@@ -499,7 +556,7 @@ st.subheader(f"🧾 Operações Realizadas ({st.session_state.contagem_ops})")
 if st.session_state.operacoes:
     st.dataframe(pd.DataFrame(st.session_state.operacoes), use_container_width=True)
 else:
-    st.info("Iniciando operações automáticas...")
+    st.info("Iniciando ciclo automático...")
 
 pode_rodar_real = modo.startswith("💰") and real_liberado
 if st.session_state.rodando_auto and (not modo.startswith("💰") or pode_rodar_real):
