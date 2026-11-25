@@ -154,6 +154,24 @@ class ClienteBinanceOKX:
         to = float((self.okx.market(ativo) or {}).get("taker") or 0.001)
         return (tb + to) * 100.0
 
+    def _liquidez_topo_suficiente(self, ex: Any, lado: str, ativo: str, lote_usdt: float) -> tuple[bool, str]:
+        """Confere se o livro de ofertas tem volume no topo para absorver o lote sem derrapagem severa."""
+        try:
+            ob = ex.fetch_order_book(ativo, limit=5) or {}
+            niveis = (ob.get("asks") if lado == "buy" else ob.get("bids")) or []
+            if not niveis:
+                return False, "Livro de ofertas vazio."
+            preco_topo = float(niveis[0][0] or 0.0)
+            qtd_topo = float(niveis[0][1] or 0.0)
+            if preco_topo <= 0 or qtd_topo <= 0:
+                return False, "Cotacao/volume invalido no topo do livro."
+            notional_topo = preco_topo * qtd_topo
+            if notional_topo < lote_usdt * 1.5:
+                return False, f"Liquidez baixa no topo ({notional_topo:.2f} USDT para lote de {lote_usdt:.2f} USDT)."
+            return True, "OK"
+        except Exception as exc:
+            return False, f"Falha ao ler livro de ofertas: {exc}"
+
     def avaliar_oportunidade(
         self,
         ativo: str = "BTC/USDT",
@@ -240,6 +258,13 @@ class ClienteBinanceOKX:
             saldo_moeda_venda=saldo_base,
         )
 
+        if spread_liquido_pct <= 0:
+            return ValidacaoArbitragem(
+                permitido=False,
+                motivo=f"Sem lucro apos taxas (spread liquido {spread_liquido_pct:+.4f}%).",
+                **base_kwargs,
+            )
+
         if spread_liquido_pct < limiar_exigido:
             return ValidacaoArbitragem(
                 permitido=False,
@@ -268,16 +293,32 @@ class ClienteBinanceOKX:
                 **base_kwargs,
             )
 
+        liq_c_ok, liq_c_msg = self._liquidez_topo_suficiente(ex_compra, "buy", ativo, lote_usdt)
+        if not liq_c_ok:
+            return ValidacaoArbitragem(
+                permitido=False,
+                motivo=f"Compra em {corretora_compra}: {liq_c_msg}",
+                **base_kwargs,
+            )
+
+        liq_v_ok, liq_v_msg = self._liquidez_topo_suficiente(ex_venda, "sell", ativo, lote_usdt)
+        if not liq_v_ok:
+            return ValidacaoArbitragem(
+                permitido=False,
+                motivo=f"Venda em {corretora_venda}: {liq_v_msg}",
+                **base_kwargs,
+            )
+
         if not live_ativo:
             return ValidacaoArbitragem(
                 permitido=False,
-                motivo="Condicoes atendidas, mas ROBO_ARBITRAGEM_ALLOW_LIVE != 1 (modo bloqueado).",
+                motivo="Lucro e liquidez ok, mas ROBO_ARBITRAGEM_ALLOW_LIVE != 1 (modo bloqueado).",
                 **base_kwargs,
             )
 
         return ValidacaoArbitragem(
             permitido=True,
-            motivo="Aprovado para execucao real.",
+            motivo="Aprovado para execucao real (lucro, saldo e liquidez validados).",
             **base_kwargs,
         )
 
@@ -294,55 +335,31 @@ class ClienteBinanceOKX:
         if os.getenv("ROBO_ARBITRAGEM_ALLOW_LIVE", "0").strip() != "1":
             raise RuntimeError("Execucao real bloqueada: defina ROBO_ARBITRAGEM_ALLOW_LIVE=1 para enviar ordens reais.")
 
-        tb = self.binance.fetch_ticker(ativo) or {}
-        to = self.okx.fetch_ticker(ativo) or {}
-        ab = float(tb.get("ask") or tb.get("last") or 0.0)
-        bb = float(tb.get("bid") or tb.get("last") or 0.0)
-        ao = float(to.get("ask") or to.get("last") or 0.0)
-        bo = float(to.get("bid") or to.get("last") or 0.0)
-        if min(ab, bb, ao, bo) <= 0:
-            raise RuntimeError("Cotacoes bid/ask invalidas.")
+        av = self.avaliar_oportunidade(
+            ativo=ativo,
+            lote_usdt=lote,
+            min_spread_liq_pct=min_spread_liq_pct,
+            slippage_buf_pct=slippage_buf_pct,
+        )
+        if not av.permitido:
+            raise RuntimeError(f"Operacao recusada por seguranca: {av.motivo}")
 
         rl = rota.replace(" ", "")
         if rl in ("Binance->OKX", "BINANCE_TO_OKX"):
-            ec, ev, pc, pv, nc, nv = self.binance, self.okx, ab, bo, "Binance", "OKX"
+            ec, ev, pc, pv, nc, nv = self.binance, self.okx, av.preco_compra, av.preco_venda, "Binance", "OKX"
         elif rl in ("OKX->Binance", "OKX_TO_BINANCE"):
-            ec, ev, pc, pv, nc, nv = self.okx, self.binance, ao, bb, "OKX", "Binance"
+            ec, ev, pc, pv, nc, nv = self.okx, self.binance, av.preco_compra, av.preco_venda, "OKX", "Binance"
         else:
-            raise ValueError(f"Rota desconhecida: {rota}")
-
-        meta_liq = (
-            float(os.getenv("ROBO_ARBITRAGEM_MIN_SPREAD_LIQ_PCT", "0.05"))
-            if min_spread_liq_pct is None
-            else float(min_spread_liq_pct)
-        )
-        buf_slip = (
-            float(os.getenv("ROBO_ARBITRAGEM_SLIPPAGE_BUF_PCT", "0.02"))
-            if slippage_buf_pct is None
-            else float(slippage_buf_pct)
-        )
-        limiar_exigido = meta_liq + buf_slip
-
-        taxas_pct = self._taxas_somadas_pct(ativo)
-        sp = ((pv - pc) / pc) * 100.0
-        spread_liq_pct = sp - taxas_pct
-        if spread_liq_pct < limiar_exigido:
-            raise RuntimeError(
-                f"Spread liquido ({spread_liq_pct:+.4f}%) abaixo do minimo exigido ({limiar_exigido:+.4f}%)."
+            ec, ev, pc, pv, nc, nv = (
+                (self.binance, self.okx, av.preco_compra, av.preco_venda, "Binance", "OKX")
+                if av.sentido == "Binance->OKX"
+                else (self.okx, self.binance, av.preco_compra, av.preco_venda, "OKX", "Binance")
             )
 
-        moeda_base = ativo.split("/")[0]
         q = float(ec.amount_to_precision(ativo, lote / pc))
         qv = float(ev.amount_to_precision(ativo, q))
         if q <= 0 or qv <= 0:
             raise ValueError("Quantidade zerada apos arredondamento.")
-
-        saldo_usdt_compra = _saldo_livre_seguro(ec, "USDT")
-        saldo_base_venda = _saldo_livre_seguro(ev, moeda_base)
-        if saldo_usdt_compra < lote:
-            raise RuntimeError(f"Saldo USDT insuficiente em {nc}: livre {saldo_usdt_compra:.4f}, necessario {lote:.4f}.")
-        if saldo_base_venda < qv:
-            raise RuntimeError(f"Saldo {moeda_base} insuficiente em {nv}: livre {saldo_base_venda:.8f}, necessario {qv:.8f}.")
 
         oc = ec.create_order(ativo, "market", "buy", q)
         ov = ev.create_order(ativo, "market", "sell", qv)
@@ -350,10 +367,11 @@ class ClienteBinanceOKX:
             "ok": True,
             "modo": "REAL",
             "ativo": ativo,
-            "rota": rota,
+            "rota": av.sentido or rota,
             "lote_usdt": lote,
-            "spread_pct": round(sp, 4),
-            "spread_liquido_pct": round(spread_liq_pct, 4),
+            "spread_pct": round(av.spread_bruto_pct, 4),
+            "spread_liquido_pct": round(av.spread_liquido_pct, 4),
+            "lucro_liq_est_usdt": round(lote * (av.spread_liquido_pct / 100.0), 5),
             "qtd_compra": q,
             "qtd_venda": qv,
             "ordem_compra_id": oc.get("id"),
@@ -361,6 +379,76 @@ class ClienteBinanceOKX:
             "compra_em": nc,
             "venda_em": nv,
         }
+
+
+def varrer_oportunidades_usdt(
+    cli: ClienteBinanceOKX,
+    pares: list[str] | tuple[str, ...] | None = None,
+    lote_usdt: float = 15.0,
+    min_spread_liq_pct: float | None = None,
+    slippage_buf_pct: float | None = None,
+    apenas_aprovados: bool = False,
+) -> list[dict[str, Any]]:
+    """Varre multiplos pares USDT na Binance e OKX mostrando rentabilidade apos taxas."""
+    cli._garantir_mercados("BTC/USDT")
+    mercados_comuns = sorted(
+        s for s, m in (cli.binance.markets or {}).items()
+        if s.endswith("/USDT")
+        and m.get("spot")
+        and s in (cli.okx.markets or {})
+        and (cli.okx.markets or {}).get(s, {}).get("spot")
+    )
+
+    if pares is None:
+        candidatos = mercados_comuns
+    else:
+        candidatos = [p.strip().upper() for p in pares if p and p.strip()]
+        candidatos = [p for p in candidatos if p in mercados_comuns]
+
+    resultados: list[dict[str, Any]] = []
+    for par in candidatos:
+        try:
+            av = cli.avaliar_oportunidade(
+                ativo=par,
+                lote_usdt=lote_usdt,
+                min_spread_liq_pct=min_spread_liq_pct,
+                slippage_buf_pct=slippage_buf_pct,
+            )
+            if apenas_aprovados and not av.permitido:
+                continue
+            lucro_est_usdt = lote_usdt * (av.spread_liquido_pct / 100.0)
+            resultados.append(
+                {
+                    "ativo": av.ativo,
+                    "sentido": av.sentido,
+                    "spread_bruto_pct": round(av.spread_bruto_pct, 4),
+                    "taxas_pct": round(av.taxas_pct, 4),
+                    "spread_liquido_pct": round(av.spread_liquido_pct, 4),
+                    "lucro_liq_est_usdt": round(lucro_est_usdt, 5),
+                    "saldo_usdt_compra": round(av.saldo_usdt_compra, 4),
+                    "saldo_moeda_venda": round(av.saldo_moeda_venda, 8),
+                    "permitido": av.permitido,
+                    "motivo": av.motivo,
+                }
+            )
+        except Exception as exc:
+            resultados.append(
+                {
+                    "ativo": par,
+                    "sentido": None,
+                    "spread_bruto_pct": 0.0,
+                    "taxas_pct": 0.0,
+                    "spread_liquido_pct": -999.0,
+                    "lucro_liq_est_usdt": 0.0,
+                    "saldo_usdt_compra": 0.0,
+                    "saldo_moeda_venda": 0.0,
+                    "permitido": False,
+                    "motivo": f"Erro na leitura: {exc}",
+                }
+            )
+
+    resultados.sort(key=lambda item: item["spread_liquido_pct"], reverse=True)
+    return resultados
 
 
 def validar_execucao_arbitragem_btc(
