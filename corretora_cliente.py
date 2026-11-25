@@ -1,137 +1,142 @@
 import os
-import time
-import ccxt
+from dataclasses import dataclass
 
 
-def _env(nome: str, padrao: str = "") -> str:
-    return (os.getenv(nome) or padrao).strip()
+@dataclass
+class ValidacaoArbitragem:
+    permitido: bool
+    motivo: str
+    sentido: str | None = None
+    corretora_compra: str | None = None
+    corretora_venda: str | None = None
+    preco_binance: float = 0.0
+    preco_okx: float = 0.0
+    spread_bruto_pct: float = 0.0
+    taxas_pct: float = 0.0
+    spread_liquido_pct: float = 0.0
+    min_spread_liq_pct: float = 0.05
+    saldo_usdt_compra: float = 0.0
+    saldo_btc_venda: float = 0.0
 
 
-class CorretoraCliente:
-    def __init__(self):
-        self.binance = ccxt.binance(
-            {
-                "apiKey": _env("BINANCE_API_KEY"),
-                "secret": _env("BINANCE_API_SECRET"),
-                "enableRateLimit": True,
-                "options": {"defaultType": "spot"},
-            }
+def _saldo_livre_seguro(exchange, moeda: str) -> float:
+    bal = exchange.fetch_balance() or {}
+    free = bal.get("free") or {}
+    if moeda in free and free[moeda] is not None:
+        return float(free[moeda])
+    dados_moeda = bal.get(moeda) or {}
+    if isinstance(dados_moeda, dict) and dados_moeda.get("free") is not None:
+        return float(dados_moeda["free"])
+    return 0.0
+
+
+def validar_execucao_arbitragem_btc(
+    cli,
+    valor_usdt_ordem: float = 15.0,
+    min_spread_liq_pct: float | None = None,
+    slippage_buf_pct: float | None = None,
+) -> ValidacaoArbitragem:
+    par = "BTC/USDT"
+    live_ativo = os.getenv("ROBO_ARBITRAGEM_ALLOW_LIVE", "0").strip() == "1"
+
+    meta_liq = (
+        float(os.getenv("ROBO_ARBITRAGEM_MIN_SPREAD_LIQ_PCT", "0.05"))
+        if min_spread_liq_pct is None
+        else float(min_spread_liq_pct)
+    )
+    buf_slip = (
+        float(os.getenv("ROBO_ARBITRAGEM_SLIPPAGE_BUF_PCT", "0.02"))
+        if slippage_buf_pct is None
+        else float(slippage_buf_pct)
+    )
+    limiar_exigido = meta_liq + buf_slip
+
+    cli.binance.load_markets()
+    cli.okx.load_markets()
+
+    pb = float(cli.binance.fetch_ticker(par)["last"])
+    po = float(cli.okx.fetch_ticker(par)["last"])
+
+    tb = float(cli.binance.market(par).get("taker") or 0.001)
+    to = float(cli.okx.market(par).get("taker") or 0.001)
+    taxas_pct = (tb + to) * 100.0
+
+    # Se OKX > Binance: compra na Binance, vende na OKX
+    # Se Binance > OKX: compra na OKX, vende na Binance
+    if po >= pb:
+        sentido = "Binance -> OKX"
+        corretora_compra, corretora_venda = "Binance", "OKX"
+        ex_compra, ex_venda = cli.binance, cli.okx
+        preco_compra, preco_venda = pb, po
+    else:
+        sentido = "OKX -> Binance"
+        corretora_compra, corretora_venda = "OKX", "Binance"
+        ex_compra, ex_venda = cli.okx, cli.binance
+        preco_compra, preco_venda = po, pb
+
+    spread_bruto_pct = ((preco_venda - preco_compra) / preco_compra) * 100.0
+    spread_liquido_pct = spread_bruto_pct - taxas_pct
+
+    saldo_usdt = _saldo_livre_seguro(ex_compra, "USDT")
+    saldo_btc = _saldo_livre_seguro(ex_venda, "BTC")
+
+    qtd_btc_estimada = valor_usdt_ordem / preco_compra if preco_compra > 0 else 0.0
+    mercado_venda = ex_venda.market(par)
+    min_amount_venda = float((mercado_venda.get("limits") or {}).get("amount", {}).get("min") or 0.00001)
+    min_cost_compra = float((ex_compra.market(par).get("limits") or {}).get("cost", {}).get("min") or 5.0)
+
+    base = dict(
+        sentido=sentido,
+        corretora_compra=corretora_compra,
+        corretora_venda=corretora_venda,
+        preco_binance=pb,
+        preco_okx=po,
+        spread_bruto_pct=spread_bruto_pct,
+        taxas_pct=taxas_pct,
+        spread_liquido_pct=spread_liquido_pct,
+        min_spread_liq_pct=limiar_exigido,
+        saldo_usdt_compra=saldo_usdt,
+        saldo_btc_venda=saldo_btc,
+    )
+
+    if spread_liquido_pct < limiar_exigido:
+        return ValidacaoArbitragem(
+            permitido=False,
+            motivo=f"Spread liquido ({spread_liquido_pct:+.4f}%) abaixo do exigido ({limiar_exigido:+.4f}%).",
+            **base,
         )
-        okx_cfg = {
-            "apiKey": _env("OKX_API_KEY"),
-            "secret": _env("OKX_API_SECRET"),
-            "enableRateLimit": True,
-            "options": {"defaultType": "spot"},
-        }
-        passphrase = _env("OKX_PASSPHRASE")
-        if passphrase:
-            okx_cfg["password"] = passphrase
-        self.okx = ccxt.okx(okx_cfg)
 
-    def _saldo_livre(self, exchange, moeda: str) -> float:
-        bal = exchange.fetch_balance()
-        moeda_u = moeda.upper()
-        info_moeda = bal.get(moeda_u)
-        if isinstance(info_moeda, dict) and info_moeda.get("free") is not None:
-            return float(info_moeda["free"] or 0.0)
-        free_dict = bal.get("free")
-        if isinstance(free_dict, dict) and free_dict.get(moeda_u) is not None:
-            return float(free_dict[moeda_u] or 0.0)
-        return 0.0
+    if valor_usdt_ordem < min_cost_compra:
+        return ValidacaoArbitragem(
+            permitido=False,
+            motivo=f"Valor da ordem ({valor_usdt_ordem:.2f} USDT) abaixo do minimo ({min_cost_compra:.2f} USDT) em {corretora_compra}.",
+            **base,
+        )
 
-    def consultar_saldo_usdt(self) -> dict:
-        res = {"Binance": 0.0, "OKX": 0.0, "erro_binance": "", "erro_okx": ""}
-        try:
-            res["Binance"] = round(self._saldo_livre(self.binance, "USDT"), 4)
-        except Exception as e:
-            res["erro_binance"] = f"Binance: {type(e).__name__}: {e}"
+    if saldo_usdt < valor_usdt_ordem:
+        return ValidacaoArbitragem(
+            permitido=False,
+            motivo=f"Saldo USDT insuficiente em {corretora_compra}: livre {saldo_usdt:.4f}, necessario {valor_usdt_ordem:.4f}.",
+            **base,
+        )
 
-        try:
-            res["OKX"] = round(self._saldo_livre(self.okx, "USDT"), 4)
-        except Exception as e:
-            res["erro_okx"] = f"OKX: {type(e).__name__}: {e}"
+    qtd_minima_exigida = max(qtd_btc_estimada, min_amount_venda)
+    if saldo_btc < qtd_minima_exigida:
+        return ValidacaoArbitragem(
+            permitido=False,
+            motivo=f"Saldo BTC insuficiente em {corretora_venda}: livre {saldo_btc:.8f}, necessario {qtd_minima_exigida:.8f}.",
+            **base,
+        )
 
-        return res
+    if not live_ativo:
+        return ValidacaoArbitragem(
+            permitido=False,
+            motivo="Condicoes atendidas, mas ROBO_ARBITRAGEM_ALLOW_LIVE != 1 (modo simulacao/bloqueado).",
+            **base,
+        )
 
-    def _corretoras_da_rota(self, rota: str):
-        texto = (rota or "").upper()
-        if "OKX" in texto.split("->")[0]:
-            return self.okx, self.binance, "OKX", "Binance"
-        return self.binance, self.okx, "Binance", "OKX"
-
-    def executar_par_arbitragem(self, ativo: str = "BTC/USDT", rota: str = "Binance -> OKX", lote_usdt: float = 10.0) -> dict:
-        if os.getenv("ROBO_ARBITRAGEM_ALLOW_LIVE") != "1":
-            return {"erro": "Modo REAL bloqueado: confirme o modo REAL no painel antes de enviar ordem."}
-
-        lote = float(lote_usdt)
-        if lote <= 0:
-            return {"erro": "Lote em USDT deve ser maior que zero."}
-
-        par = ativo.upper().strip()
-        if "/" not in par:
-            return {"erro": f"Par invalido: {ativo}"}
-        moeda_base, moeda_cotacao = par.split("/", 1)
-        if moeda_cotacao != "USDT":
-            return {"erro": f"Apenas pares contra USDT sao suportados no momento (recebido: {par})."}
-
-        ex_compra, ex_venda, nome_compra, nome_venda = self._corretoras_da_rota(rota)
-
-        try:
-            ex_compra.load_markets()
-            ex_venda.load_markets()
-
-            ticker_compra = ex_compra.fetch_ticker(par)
-            preco_compra = float(ticker_compra.get("ask") or ticker_compra.get("last") or 0.0)
-            if preco_compra <= 0:
-                return {"erro": f"Preco de compra invalido em {nome_compra} para {par}."}
-
-            qtd_moeda = float(ex_compra.amount_to_precision(par, lote / preco_compra))
-            if qtd_moeda <= 0:
-                return {"erro": f"Quantidade calculada zerada para {par} com lote {lote} USDT."}
-
-            saldo_usdt_compra = self._saldo_livre(ex_compra, "USDT")
-            custo_estimado_usdt = qtd_moeda * preco_compra * 1.003
-            if saldo_usdt_compra < custo_estimado_usdt:
-                return {
-                    "erro": (
-                        f"Saldo USDT insuficiente em {nome_compra}: tem {saldo_usdt_compra:.4f} USDT, "
-                        f"precisa ~{custo_estimado_usdt:.4f} USDT."
-                    )
-                }
-
-            saldo_base_venda = self._saldo_livre(ex_venda, moeda_base)
-            if saldo_base_venda < qtd_moeda:
-                return {
-                    "erro": (
-                        f"Saldo {moeda_base} insuficiente em {nome_venda} para vender simultaneamente: "
-                        f"tem {saldo_base_venda:.6f} {moeda_base}, precisa {qtd_moeda:.6f} {moeda_base}."
-                    )
-                }
-
-            ordem_compra = ex_compra.create_market_buy_order(par, qtd_moeda)
-            try:
-                ordem_venda = ex_venda.create_market_sell_order(par, qtd_moeda)
-            except Exception as err_venda:
-                # Tenta reverter a compra na ponta de origem para nao ficar exposto de um lado so
-                try:
-                    ex_compra.create_market_sell_order(par, qtd_moeda)
-                except Exception:
-                    pass
-                return {
-                    "erro": (
-                        f"Venda falhou em {nome_venda} ({type(err_venda).__name__}: {err_venda}). "
-                        f"Tentativa de reversao automatica executada em {nome_compra}."
-                    )
-                }
-
-            return {
-                "ok": True,
-                "timestamp": int(time.time()),
-                "par": par,
-                "rota": f"{nome_compra} -> {nome_venda}",
-                "quantidade": qtd_moeda,
-                "ordem_compra_id": ordem_compra.get("id"),
-                "ordem_venda_id": ordem_venda.get("id"),
-            }
-        except Exception as e:
-            return {"erro": f"{type(e).__name__}: {e}"}
+    return ValidacaoArbitragem(
+        permitido=True,
+        motivo="Aprovado para execucao real em BTC/USDT.",
+        **base,
+    )
