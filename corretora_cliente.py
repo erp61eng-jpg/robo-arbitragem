@@ -1,4 +1,3 @@
-
 C:\Projetos\robo_arbitragem>cd /d C:\Projetos\robo_arbitragem&&python -c "import corretora_cliente as cc;cli=cc.ClienteBinanceOKX();print('pwd_len:',len(getattr(cli.okx,'password',None) or ''));lines=open('corretora_cliente.py',encoding='utf-8').read().splitlines();print('\n'.join(f'{i+1}: {lines[i]}' for i in range(69,min(115,len(lines)))))"
 pwd_len: 0
 70:         okx_api_key: str | None = None,
